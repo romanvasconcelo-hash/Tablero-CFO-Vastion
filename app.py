@@ -1,10 +1,8 @@
 # ============================================================================
-# TABLERO CFO VASTION · Cargador de Roberto  v0.2
-# Pantalla de arrastrar-y-soltar. Roberto sube los archivos del mes,
-# da un clic, y ve el veredicto: VALIDADO / VALIDADO con advertencias / RETENIDO.
-# Reusa los parsers y compuertas ya validados contra dato real.
-#
-# v0.2: integridad respeta severidad (continuidad ya no bloquea, solo advierte).
+# TABLERO CFO VASTION · App de Roberto  v0.3
+# Carga + validación + REPORTE INTERNO de indicadores.
+# Tras validar, muestra 3 indicadores clave (uno por eje), el P&L de Gestión
+# y los indicadores de apoyo. Vista interna (Roberto/Vastion): muestra todo.
 # ============================================================================
 import streamlit as st
 import psycopg2
@@ -13,27 +11,22 @@ import xml.etree.ElementTree as ET
 import openpyxl, hashlib, io
 from datetime import datetime, date
 
-st.set_page_config(page_title="Tablero CFO Vastion · Carga", page_icon="📊", layout="centered")
+st.set_page_config(page_title="Tablero CFO Vastion", page_icon="📊", layout="centered")
 
-# ---------------------------------------------------------------------------
-# CONEXIÓN (desde st.secrets — configurada en Streamlit Cloud, no aquí)
-# ---------------------------------------------------------------------------
 def get_conn():
     s = st.secrets["db"]
     return psycopg2.connect(host=s["host"], port=s["port"], dbname=s["dbname"],
                             user=s["user"], password=s["password"])
 
 # ---------------------------------------------------------------------------
-# PARSERS (validados; leen desde bytes del archivo subido)
+# PARSERS
 # ---------------------------------------------------------------------------
 def _ns(root): return root.tag[root.tag.find('{')+1:root.tag.find('}')]
 def _sha(data): return hashlib.sha256(data).hexdigest()
 
 def clasificar(nombre, data):
-    """Detecta qué es cada archivo por su contenido, no por su nombre."""
     if nombre.lower().endswith('.xml'):
-        root = ET.fromstring(data)
-        tag = root.tag.lower()
+        root = ET.fromstring(data); tag = root.tag.lower()
         if 'balanza' in tag: return 'BALANZA'
         if 'catalogo' in tag or 'catálogo' in tag: return 'CATALOGO'
         return 'XML_DESCONOCIDO'
@@ -100,7 +93,7 @@ def parse_cfdi(data):
     return out
 
 # ---------------------------------------------------------------------------
-# CARGA + VALIDACIÓN (misma lógica que el cargador validado)
+# CARGA + VALIDACIÓN
 # ---------------------------------------------------------------------------
 def registrar(cur, cli, per, tipo, envio, nombre, data):
     cur.execute("""INSERT INTO origen_archivo (cliente_id,periodo,tipo,envio,storage_path,hash_sha256,bytes,cargado_por)
@@ -112,12 +105,10 @@ def registrar(cur, cli, per, tipo, envio, nombre, data):
                 (cli, per, tipo, _sha(data))); return cur.fetchone()[0], False
 
 def procesar(cli, archivos):
-    """archivos: dict tipo -> (nombre, data). Devuelve (periodo, integridad, madurez)."""
     conn = get_conn(); conn.autocommit = False; cur = conn.cursor()
     try:
         if 'CATALOGO' in archivos:
-            nom, data = archivos['CATALOGO']
-            cat_rows = parse_catalogo(data)
+            nom, data = archivos['CATALOGO']; cat_rows = parse_catalogo(data)
         nomb, datab = archivos['BALANZA']
         meta, brows = parse_balanza(datab); per = f"{meta['anio']}-{meta['mes']}-01"
         envio = 'COMPLEMENTARIA' if meta['envio']=='C' else 'NORMAL'
@@ -131,8 +122,7 @@ def procesar(cli, archivos):
         cur.execute("""SELECT id FROM origen_archivo WHERE cliente_id=%s AND tipo='CATALOGO' AND periodo<=%s
                        ORDER BY periodo DESC,version DESC LIMIT 1""", (cli, per))
         rcat = cur.fetchone()
-        if not rcat:
-            raise RuntimeError("No hay catálogo para este cliente. Sube el catálogo XML la primera vez.")
+        if not rcat: raise RuntimeError("No hay catálogo para este cliente. Sube el catálogo XML la primera vez.")
         cat_id = rcat[0]
         bal_id, bal_new = registrar(cur, cli, per, 'BALANZA', envio, nomb, datab)
         if bal_new:
@@ -163,11 +153,49 @@ def procesar(cli, archivos):
         if not bloqueo:
             cur.execute("UPDATE periodo_estado SET estado='VALIDADO',validado_en=now() WHERE cliente_id=%s AND periodo=%s", (cli, per))
         conn.commit()
-        return per, integ, madz
+        return per, bal_id, integ, madz
     except Exception:
         conn.rollback(); raise
     finally:
         cur.close(); conn.close()
+
+# ---------------------------------------------------------------------------
+# INDICADORES (reporte interno)
+# ---------------------------------------------------------------------------
+def cargar_indicadores(bal_id, cli, per):
+    conn = get_conn(); cur = conn.cursor(); ind = {}
+    try:
+        cur.execute("SELECT concepto,monto,pct FROM fn_pl_gestion(%s) ORDER BY orden", (bal_id,))
+        pl = cur.fetchall()
+        ind['pl'] = [(c, float(m), (float(p) if p is not None else None)) for c,m,p in pl]
+        d = {c:(float(m), (float(p) if p is not None else None)) for c,m,p in pl}
+        ing = d.get('Ingresos',(0,0))[0]
+        lab = d.get('(-) Eficiencia Laboral',(0,0))[0]
+        mb  = d.get('= MARGEN BRUTO DE GESTIÓN',(0,0))[0]
+        ind['pretax_pct'] = d.get('= UTILIDAD ANTES DE IMPUESTOS',(0,None))[1]
+        ind['mb_pct']     = d.get('= MARGEN BRUTO DE GESTIÓN',(0,None))[1]
+        ind['nomina_pct'] = round(lab/ing*100,1) if ing else None
+        ind['gpld']       = round(mb/lab,2) if lab and mb>0 else None
+        cur.execute("SELECT concepto,valor FROM fn_cash_lag(%s)", (bal_id,))
+        cl = {c:(float(v) if v is not None else None) for c,v in cur.fetchall()}
+        ind['cash_lag'] = next((v for k,v in cl.items() if k.startswith('Cash Lag')), None)
+        ind['caja']     = cl.get('Caja fin de mes')
+        cur.execute("SELECT concepto,valor FROM fn_eiva(%s,%s)", (cli, per))
+        ev = {c:(float(v) if v is not None else None) for c,v in cur.fetchall()}
+        ind['eiva_pct']  = ev.get('EIVA % (acred/tras)')
+        ind['iva_neto']  = ev.get('IVA neto (+cargo / -favor)')
+        return ind
+    finally:
+        cur.close(); conn.close()
+
+def sem_pretax(p):
+    if p is None: return "—"
+    if p >= 10: return "🟢 Sano (≥10%)"
+    if p >= 5:  return "🟡 Mínimo (5–9%)"
+    return "🔴 Peligro (<5%)"
+
+def money(v):
+    return "—" if v is None else f"${v:,.0f}"
 
 # ---------------------------------------------------------------------------
 # INTERFAZ
@@ -198,15 +226,15 @@ if subidos:
         data = f.getvalue(); tipo = clasificar(f.name, data)
         archivos[tipo] = (f.name, data)
     etiquetas = {'BALANZA':'Balanza','CATALOGO':'Catálogo','CFDI_EMITIDO':'CFDI emitidos','CFDI_RECIBIDO':'CFDI recibidos'}
-    detectados = [etiquetas.get(t, t) for t in archivos]
-    st.info("Detecté: " + ", ".join(detectados))
+    st.info("Detecté: " + ", ".join(etiquetas.get(t, t) for t in archivos))
     if 'BALANZA' not in archivos:
         st.error("Falta la balanza (XML). Es obligatoria.")
 
 if st.button("Cargar y validar", type="primary", disabled=not (subidos and 'BALANZA' in archivos)):
     with st.spinner("Cargando y validando…"):
         try:
-            per, integ, madz = procesar(cli_id, archivos)
+            per, bal_id, integ, madz = procesar(cli_id, archivos)
+            ind = cargar_indicadores(bal_id, cli_id, per)
         except Exception as e:
             st.error(f"Error al procesar: {e}"); st.stop()
 
@@ -221,11 +249,48 @@ if st.button("Cargar y validar", type="primary", disabled=not (subidos and 'BALA
     else:
         st.success(f"## 🟢 VALIDADO · {per}\nEl periodo entra al tablero.")
 
-    st.subheader("Integridad")
-    for p, ok, sev, det in integ:
-        icono = "✅" if ok else ("🟡" if sev=='ADVERTENCIA' else "❌")
-        st.write(f"{icono}  **{p}** — {det}")
-    st.subheader("Madurez analítica")
-    for p, ok, sev, det in madz:
-        icono = "✅" if ok else ("🟡" if sev=='ADVERTENCIA' else "❌")
-        st.write(f"{icono}  **{p}** ({sev}) — {det}")
+    # ---- 3 indicadores clave, uno por eje ----
+    st.subheader("Indicadores clave")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.caption("EJE 1 · GENERACIÓN")
+        st.metric("Pre-Tax Profit %", f"{ind['pretax_pct']}%" if ind['pretax_pct'] is not None else "—")
+        st.caption(sem_pretax(ind['pretax_pct']))
+    with c2:
+        st.caption("EJE 2 · TRASLADO")
+        st.metric("Cash Lag", money(ind['cash_lag']))
+        if ind['cash_lag'] is None:
+            st.caption("Necesita mes previo")
+        elif ind['cash_lag'] > 0:
+            st.caption("🔴 Caja cayó más que la utilidad")
+        else:
+            st.caption("🟢 Caja por encima de la utilidad")
+    with c3:
+        st.caption("EJE 3 · FISCAL")
+        st.metric("EIVA %", f"{ind['eiva_pct']}%" if ind['eiva_pct'] is not None else "—")
+        if ind['iva_neto'] is not None:
+            st.caption(("IVA a cargo " + money(ind['iva_neto'])) if ind['iva_neto'] > 0
+                       else ("IVA a favor " + money(abs(ind['iva_neto']))))
+
+    # ---- indicadores de apoyo ----
+    st.subheader("Apoyo")
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Margen Bruto %", f"{ind['mb_pct']}%" if ind['mb_pct'] is not None else "—")
+    a2.metric("Nómina / Ingresos", f"{ind['nomina_pct']}%" if ind['nomina_pct'] is not None else "—")
+    a3.metric("GPLD", f"{ind['gpld']}x" if ind['gpld'] is not None else "n/a")
+    a4.metric("Caja fin de mes", money(ind['caja']))
+
+    # ---- P&L de Gestión ----
+    with st.expander("P&L de Gestión (no constituye estado de resultados NIF)"):
+        st.dataframe(
+            [{"Concepto": c, "Monto": f"{m:,.0f}", "%": (f"{p}%" if p is not None else "")} for c,m,p in ind['pl']],
+            use_container_width=True, hide_index=True)
+
+    # ---- detalle de compuertas ----
+    with st.expander("Detalle de validación"):
+        st.markdown("**Integridad**")
+        for p, ok, sev, det in integ:
+            st.write((("✅" if ok else ("🟡" if sev=='ADVERTENCIA' else "❌"))) + f"  **{p}** — {det}")
+        st.markdown("**Madurez analítica**")
+        for p, ok, sev, det in madz:
+            st.write((("✅" if ok else ("🟡" if sev=='ADVERTENCIA' else "❌"))) + f"  **{p}** ({sev}) — {det}")
