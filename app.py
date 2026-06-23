@@ -197,6 +197,26 @@ def sem_pretax(p):
 def money(v):
     return "—" if v is None else f"${v:,.0f}"
 
+
+def tendencia(cli):
+    conn = get_conn(); cur = conn.cursor(); out = []
+    try:
+        cur.execute("SELECT periodo, archivo_vigente, estado FROM periodo_estado WHERE cliente_id=%s ORDER BY periodo", (cli,))
+        for per, bal, estado in cur.fetchall():
+            if bal is None: continue
+            cur.execute("SELECT pl.pct FROM fn_pl_gestion(%s) pl WHERE pl.concepto='= UTILIDAD ANTES DE IMPUESTOS'", (bal,))
+            r = cur.fetchone(); pretax = float(r[0]) if r and r[0] is not None else None
+            cur.execute("SELECT concepto,valor FROM fn_cash_lag(%s)", (bal,))
+            cl = {c:(float(v) if v is not None else None) for c,v in cur.fetchall()}
+            caja = cl.get('Caja fin de mes')
+            cash_lag = next((v for k,v in cl.items() if k.startswith('Cash Lag')), None)
+            cur.execute("SELECT 1 FROM fn_validar_madurez(%s) WHERE paso=false LIMIT 1", (bal,)); adv_m = cur.fetchone() is not None
+            cur.execute("SELECT 1 FROM fn_validar_periodo(%s) WHERE paso=false LIMIT 1", (bal,)); adv_i = cur.fetchone() is not None
+            out.append(dict(periodo=str(per)[:7], pretax=pretax, caja=caja, cash_lag=cash_lag, flag=(adv_m or adv_i)))
+        return out
+    finally:
+        cur.close(); conn.close()
+
 # ---------------------------------------------------------------------------
 # INTERFAZ
 # ---------------------------------------------------------------------------
@@ -294,3 +314,28 @@ if st.button("Cargar y validar", type="primary", disabled=not (subidos and 'BALA
         st.markdown("**Madurez analítica**")
         for p, ok, sev, det in madz:
             st.write((("✅" if ok else ("🟡" if sev=='ADVERTENCIA' else "❌"))) + f"  **{p}** ({sev}) — {det}")
+
+
+# ---------------------------------------------------------------------------
+# COMPARATIVO DE MESES CARGADOS
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Tendencia de los meses cargados")
+if st.button("Ver tendencia"):
+    datos = tendencia(cli_id)
+    if not datos:
+        st.info("Este cliente no tiene meses cargados todavía.")
+    else:
+        filas = [{"Mes": d["periodo"],
+                  "Caja": money(d["caja"]),
+                  "Pre-Tax %": (f"{d['pretax']}%" if d["pretax"] is not None else "—"),
+                  "Cash Lag": money(d["cash_lag"]),
+                  "Comparable": ("⚠️ con observaciones" if d["flag"] else "✓ limpio")} for d in datos]
+        st.dataframe(filas, use_container_width=True, hide_index=True)
+        import pandas as pd
+        caja_df = pd.DataFrame([{"Mes": d["periodo"], "Caja": d["caja"]} for d in datos if d["caja"] is not None]).set_index("Mes")
+        if not caja_df.empty:
+            st.caption("Caja al cierre por mes")
+            st.line_chart(caja_df)
+        if any(d["flag"] for d in datos):
+            st.caption("⚠️ Los meses marcados traen observaciones de contabilidad (en recontabilización). La tendencia puede no reflejar la operación real hasta que se ajusten.")
