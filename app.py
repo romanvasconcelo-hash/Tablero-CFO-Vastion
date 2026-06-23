@@ -1,11 +1,10 @@
 # ============================================================================
-# TABLERO CFO VASTION · Cargador de Roberto  v0.1
+# TABLERO CFO VASTION · Cargador de Roberto  v0.2
 # Pantalla de arrastrar-y-soltar. Roberto sube los archivos del mes,
-# da un clic, y ve el veredicto: VALIDADO o RETENIDO con el porqué.
+# da un clic, y ve el veredicto: VALIDADO / VALIDADO con advertencias / RETENIDO.
 # Reusa los parsers y compuertas ya validados contra dato real.
 #
-# Despliegue: Streamlit Community Cloud (gratis). La conexión a Supabase
-# vive en los "secrets" de Streamlit, NUNCA en este archivo.
+# v0.2: integridad respeta severidad (continuidad ya no bloquea, solo advierte).
 # ============================================================================
 import streamlit as st
 import psycopg2
@@ -116,36 +115,29 @@ def procesar(cli, archivos):
     """archivos: dict tipo -> (nombre, data). Devuelve (periodo, integridad, madurez)."""
     conn = get_conn(); conn.autocommit = False; cur = conn.cursor()
     try:
-        # ---- catálogo: el subido, o el más reciente ya cargado ----
         if 'CATALOGO' in archivos:
             nom, data = archivos['CATALOGO']
             cat_rows = parse_catalogo(data)
-        # ---- balanza (obligatoria) ----
         nomb, datab = archivos['BALANZA']
         meta, brows = parse_balanza(datab); per = f"{meta['anio']}-{meta['mes']}-01"
         envio = 'COMPLEMENTARIA' if meta['envio']=='C' else 'NORMAL'
-        # respaldar RFC
         cur.execute("UPDATE cliente SET rfc=%s WHERE id=%s AND (rfc IS NULL OR rfc='')", (meta['rfc'], cli))
-        # registrar catálogo si vino
         if 'CATALOGO' in archivos:
             cat_id, cat_new = registrar(cur, cli, per, 'CATALOGO', None, nom, data)
             if cat_new:
                 execute_values(cur, """INSERT INTO raw_catalogo (archivo_id,cliente_id,num_cuenta,descripcion,cod_agrupador,subcuenta_de,nivel,naturaleza)
                     VALUES %s ON CONFLICT DO NOTHING""",
                     [(cat_id,cli,c['num_cuenta'],c['descripcion'],c['cod_agrupador'],c['subcuenta_de'],c['nivel'],c['naturaleza']) for c in cat_rows])
-        # localizar catálogo vigente (subido o previo)
         cur.execute("""SELECT id FROM origen_archivo WHERE cliente_id=%s AND tipo='CATALOGO' AND periodo<=%s
                        ORDER BY periodo DESC,version DESC LIMIT 1""", (cli, per))
         rcat = cur.fetchone()
         if not rcat:
             raise RuntimeError("No hay catálogo para este cliente. Sube el catálogo XML la primera vez.")
         cat_id = rcat[0]
-        # balanza
         bal_id, bal_new = registrar(cur, cli, per, 'BALANZA', envio, nomb, datab)
         if bal_new:
             execute_values(cur, "INSERT INTO raw_balanza (archivo_id,num_cuenta,saldo_inicial,debe,haber,saldo_final) VALUES %s ON CONFLICT DO NOTHING",
                 [(bal_id,)+r for r in brows])
-        # insumos (ruteo vía fn_bloque)
         cur.execute("DELETE FROM insumos_balanza WHERE archivo_id=%s", (bal_id,))
         cur.execute("""INSERT INTO insumos_balanza (archivo_id,cliente_id,periodo,num_cuenta,cod_agrupador,naturaleza,es_hoja,es_orden,bloque,es_laboral,saldo_final)
             SELECT b.archivo_id,%(cli)s,%(per)s,b.num_cuenta,c.cod_agrupador,c.naturaleza,
@@ -156,7 +148,6 @@ def procesar(cli, archivos):
             dict(cli=cli, per=per, cat=cat_id, bal=bal_id))
         cur.execute("""INSERT INTO periodo_estado (cliente_id,periodo,estado,archivo_vigente) VALUES (%s,%s,'RECIBIDO',%s)
                        ON CONFLICT (cliente_id,periodo) DO UPDATE SET archivo_vigente=EXCLUDED.archivo_vigente""", (cli, per, bal_id))
-        # CFDI (si vinieron)
         for tipo in ('CFDI_EMITIDO', 'CFDI_RECIBIDO'):
             if tipo not in archivos: continue
             nomc, datac = archivos[tipo]; crows = parse_cfdi(datac)
@@ -166,10 +157,9 @@ def procesar(cli, archivos):
             if new:
                 execute_values(cur, """INSERT INTO raw_cfdi (uuid,renglon,direccion,periodo,fecha_emision,fecha_timbrado,tipo_cfdi,uso_cfdi,estatus_sat,contraparte_rfc,contraparte_nom,concepto,subtotal,descuento,iva_16,iva_8,iva_retenido,isr_retenido,total,cuenta_contable,centro_costos,uuid_relacionado,cliente_id,archivo_id)
                     VALUES %s ON CONFLICT DO NOTHING""", [t+(cli,arch) for t in crows])
-        # compuertas
-        cur.execute("SELECT prueba,paso,detalle FROM fn_validar_periodo(%s)", (bal_id,)); integ = cur.fetchall()
+        cur.execute("SELECT prueba,paso,severidad,detalle FROM fn_validar_periodo(%s)", (bal_id,)); integ = cur.fetchall()
         cur.execute("SELECT prueba,paso,severidad,detalle FROM fn_validar_madurez(%s)", (bal_id,)); madz = cur.fetchall()
-        bloqueo = any((not ok) for _,ok,_ in integ) or any((not ok) and sev=='BLOQUEANTE' for _,ok,sev,_ in madz)
+        bloqueo = any((not ok) and sev=='BLOQUEANTE' for _,ok,sev,_ in integ) or any((not ok) and sev=='BLOQUEANTE' for _,ok,sev,_ in madz)
         if not bloqueo:
             cur.execute("UPDATE periodo_estado SET estado='VALIDADO',validado_en=now() WHERE cliente_id=%s AND periodo=%s", (cli, per))
         conn.commit()
@@ -185,7 +175,6 @@ def procesar(cli, archivos):
 st.title("📊 Tablero CFO Vastion")
 st.caption("Carga mensual · arrastra los archivos del cliente y valida")
 
-# cliente
 try:
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT id, nombre FROM cliente ORDER BY nombre")
@@ -202,7 +191,7 @@ cli_id = dict((c[1], c[0]) for c in clientes)[nombre_sel]
 st.markdown("**Suelta aquí los archivos del mes** (balanza XML obligatoria; catálogo XML la primera vez; CFDI emitidos y recibidos):")
 subidos = st.file_uploader("Arrastra los archivos", accept_multiple_files=True,
                            type=['xml','xlsx'], label_visibility='collapsed')
-cur.execute("SELECT prueba,paso,severidad,detalle FROM fn_validar_periodo(%s)", (bal_id,)); integ = cur.fetchall()
+
 archivos = {}
 if subidos:
     for f in subidos:
@@ -221,8 +210,8 @@ if st.button("Cargar y validar", type="primary", disabled=not (subidos and 'BALA
         except Exception as e:
             st.error(f"Error al procesar: {e}"); st.stop()
 
-    bloqueo = any(not ok for _,ok,_ in integ) or any((not ok) and sev=='BLOQUEANTE' for _,ok,sev,_ in madz)
-    adv = any((not ok) and sev=='ADVERTENCIA' for _,ok,sev,_ in madz)
+    bloqueo = any((not ok) and sev=='BLOQUEANTE' for _,ok,sev,_ in integ) or any((not ok) and sev=='BLOQUEANTE' for _,ok,sev,_ in madz)
+    adv = any((not ok) and sev=='ADVERTENCIA' for _,ok,sev,_ in integ) or any((not ok) and sev=='ADVERTENCIA' for _,ok,sev,_ in madz)
 
     st.divider()
     if bloqueo:
@@ -233,8 +222,9 @@ if st.button("Cargar y validar", type="primary", disabled=not (subidos and 'BALA
         st.success(f"## 🟢 VALIDADO · {per}\nEl periodo entra al tablero.")
 
     st.subheader("Integridad")
-    for p, ok, det in integ:
-        st.write(("✅" if ok else "❌") + f"  **{p}** — {det}")
+    for p, ok, sev, det in integ:
+        icono = "✅" if ok else ("🟡" if sev=='ADVERTENCIA' else "❌")
+        st.write(f"{icono}  **{p}** — {det}")
     st.subheader("Madurez analítica")
     for p, ok, sev, det in madz:
         icono = "✅" if ok else ("🟡" if sev=='ADVERTENCIA' else "❌")
