@@ -217,6 +217,40 @@ def tendencia(cli):
     finally:
         cur.close(); conn.close()
 
+
+def datos_reporte_cliente(cli, periodo):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT archivo_vigente FROM periodo_estado WHERE cliente_id=%s AND periodo=%s", (cli, periodo))
+        r = cur.fetchone()
+        if not r or not r[0]: return None
+        bal = r[0]
+        cur.execute("""SELECT archivo_vigente FROM periodo_estado
+                       WHERE cliente_id=%s AND periodo<%s AND archivo_vigente IS NOT NULL
+                       ORDER BY periodo DESC LIMIT 1""", (cli, periodo))
+        rp = cur.fetchone()
+        caja_prev = None
+        if rp:
+            cur.execute("""SELECT COALESCE(SUM(b.saldo_final),0) FROM insumos_balanza i
+                           JOIN raw_balanza b ON b.archivo_id=i.archivo_id AND b.num_cuenta=i.num_cuenta
+                           WHERE i.archivo_id=%s AND i.es_hoja AND (i.cod_agrupador LIKE '101%%' OR i.cod_agrupador LIKE '102%%')""", (rp[0],))
+            caja_prev = float(cur.fetchone()[0])
+    finally:
+        cur.close(); conn.close()
+    ind = cargar_indicadores(bal, cli, periodo)
+    ind['caja_prev'] = caja_prev
+    ind['caja_var'] = (ind['caja'] - caja_prev) if (ind['caja'] is not None and caja_prev is not None) else None
+    return ind
+
+def periodos_cargados(cli):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""SELECT periodo FROM periodo_estado WHERE cliente_id=%s AND archivo_vigente IS NOT NULL
+                       ORDER BY periodo DESC""", (cli,))
+        return [str(r[0]) for r in cur.fetchall()]
+    finally:
+        cur.close(); conn.close()
+
 # ---------------------------------------------------------------------------
 # INTERFAZ
 # ---------------------------------------------------------------------------
@@ -339,3 +373,48 @@ if st.button("Ver tendencia"):
             st.line_chart(caja_df)
         if any(d["flag"] for d in datos):
             st.caption("⚠️ Los meses marcados traen observaciones de contabilidad (en recontabilización). La tendencia puede no reflejar la operación real hasta que se ajusten.")
+
+
+# ---------------------------------------------------------------------------
+# REPORTE DEL CLIENTE (vista dueño)
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Reporte del cliente")
+_periodos = periodos_cargados(cli_id)
+if not _periodos:
+    st.caption("Carga al menos un mes para generar el reporte del cliente.")
+else:
+    mes_rep = st.selectbox("Mes a reportar", _periodos, key="rep_mes")
+    if st.button("Generar reporte del cliente"):
+        ind = datos_reporte_cliente(cli_id, mes_rep)
+        if ind is None:
+            st.error("No se encontró ese mes.")
+        else:
+            st.markdown(f"### {nombre_sel}  ·  {mes_rep[:7]}")
+            # caja al centro
+            if ind["caja_var"] is not None:
+                st.metric("Tu caja al cierre del mes", money(ind["caja"]), delta=f"{ind['caja_var']:,.0f} vs mes anterior")
+                direccion = "bajó" if ind["caja_var"] < 0 else "subió"
+                st.write(f"Tu caja {direccion} **{money(abs(ind['caja_var']))}** respecto al mes anterior.")
+            else:
+                st.metric("Tu caja al cierre del mes", money(ind["caja"]))
+                st.caption("Sin mes anterior para comparar.")
+            # tres indicadores en lenguaje de dueño
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Rentabilidad del mes", f"{ind['pretax_pct']}%" if ind["pretax_pct"] is not None else "—")
+                st.caption(sem_pretax(ind["pretax_pct"]))
+            with c2:
+                st.metric("Margen de tu operación", f"{ind['mb_pct']}%" if ind["mb_pct"] is not None else "—")
+            with c3:
+                st.metric("Brecha utilidad vs. caja", money(ind["cash_lag"]))
+                if ind["cash_lag"] is not None and ind["cash_lag"] > 0:
+                    st.caption("🔴 La utilidad no llegó a caja")
+                elif ind["cash_lag"] is not None:
+                    st.caption("🟢 La caja subió con la utilidad")
+            # lectura del mes (la escribe Roberto)
+            st.markdown("**Lo que esto significa** (escríbelo para el dueño)")
+            st.text_area("Lectura del mes", key="rep_lectura",
+                         placeholder="Ej.: El negocio es rentable, pero la utilidad se quedó en cobranza. Prioridad: cobrar, no vender.",
+                         label_visibility="collapsed")
+            st.caption("Los números los pone el sistema. La lectura la escribe el CFO.")
