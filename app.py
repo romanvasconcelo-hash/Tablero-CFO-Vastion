@@ -202,7 +202,7 @@ cli_id = dict((c[1], c[0]) for c in clientes)[nombre_sel]
 st.markdown("**Suelta aquí los archivos del mes** (balanza XML obligatoria; catálogo XML la primera vez; CFDI emitidos y recibidos):")
 subidos = st.file_uploader("Arrastra los archivos", accept_multiple_files=True,
                            type=['xml','xlsx'], label_visibility='collapsed')
-
+cur.execute("SELECT prueba,paso,severidad,detalle FROM fn_validar_periodo(%s)", (bal_id,)); integ = cur.fetchall()
 archivos = {}
 if subidos:
     for f in subidos:
