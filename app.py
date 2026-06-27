@@ -252,8 +252,30 @@ def periodos_cargados(cli):
         cur.close(); conn.close()
  
  
+SAT_LBL = {
+    '101':'Caja','102':'Bancos','103':'Inversiones','104':'Inversiones',
+    '105':'Clientes','106':'Documentos por cobrar','107':'Deudores diversos',
+    '108':'IVA acreditable pagado','109':'Anticipo a proveedores','110':'Otras cuentas por cobrar',
+    '113':'Impuestos a favor','114':'Pagos provisionales','115':'Inventarios',
+    '116':'Obra en proceso','117':'Obra en proceso','118':'IVA acreditable',
+    '119':'IVA pendiente de acreditar','120':'Anticipo a proveedores','121':'Inventarios',
+    '126':'Pagos anticipados','151':'Terrenos','152':'Edificios','153':'Maquinaria y equipo',
+    '154':'Equipo de transporte','155':'Equipo de cómputo','156':'Mobiliario y equipo',
+    '157':'Equipo','158':'Equipo','159':'(−) Depreciación acumulada','171':'(−) Depreciación acumulada',
+    '172':'(−) Amortización acumulada','174':'Activos intangibles','180':'Activos diferidos','184':'Otros activos',
+    '201':'Proveedores','202':'Créditos bancarios CP','203':'Cuentas por pagar','204':'Cuentas por pagar',
+    '205':'Acreedores diversos','206':'Cuentas por pagar','207':'IVA trasladado cobrado','208':'Anticipo de clientes',
+    '209':'IVA trasladado por cobrar','210':'Provisiones','211':'Provisiones de nómina','213':'Impuestos por pagar',
+    '214':'Impuestos por pagar','215':'PTU por pagar','216':'Impuestos retenidos',
+    '251':'Créditos bancarios LP','252':'Documentos por pagar LP','253':'Acreedores LP',
+    '301':'Capital social y aportaciones','302':'Aportaciones','303':'Reservas',
+    '304':'Resultados de ejercicios anteriores','305':'Resultado del ejercicio',
+}
+def _lbl(code): return SAT_LBL.get(code, "Agrupador " + (code or "?"))
+ 
 def estados_financieros(archivo_id):
-    """ER (NIF) + Balance General + EFE (indirecto) desde la balanza. Lógica validada en datos reales."""
+    """ER (NIF) + Balance General + EFE (indirecto) por partida. Lógica validada en datos reales."""
+    from collections import defaultdict
     conn = get_conn(); cur = conn.cursor()
     try:
         cur.execute("""
@@ -266,29 +288,44 @@ def estados_financieros(archivo_id):
         rows = cur.fetchall()
     finally:
         cur.close(); conn.close()
-    acc = [dict(ag=(a or ''), nat=(n or ''), sf=float(sf or 0),
+    acc = [dict(ag=(a or ''), g=(a or '')[:3], nat=(n or ''), sf=float(sf or 0),
                 si=float(si or 0), d=float(d or 0), h=float(h or 0))
            for a,n,sf,si,d,h in rows]
-    p3 = lambda x: x['ag'][:3]; p1 = lambda x: x['ag'][:1]
-    # --- Estado de Resultados (movimiento del mes) ---
-    ing = sum(x['h']-x['d'] for x in acc if p3(x) in ('401','402','403'))
-    cos = sum(x['d']-x['h'] for x in acc if p3(x) in ('501','502','503'))
-    gas = sum(x['d']-x['h'] for x in acc if p3(x) in ('601','604'))
-    dep = sum(x['d']-x['h'] for x in acc if p3(x)=='613')
-    gf  = sum(x['d']-x['h'] for x in acc if p3(x)=='701')
-    pf  = sum(x['h']-x['d'] for x in acc if p3(x)=='702')
-    uai = ing-cos-gas-dep-gf+pf
-    er = dict(ing=ing, cos=cos, ub=ing-cos, gas=gas, dep=dep, gf=gf, pf=pf, uai=uai)
-    # --- Balance General (saldos firmados por naturaleza) ---
+    p1 = lambda x: x['ag'][:1]
+    DEP = ('159','171','172','613','614')
+    # ---- Estado de Resultados (todo 4/5/6/7) ----
+    ing = sum(x['h']-x['d'] for x in acc if p1(x)=='4')
+    cos = sum(x['d']-x['h'] for x in acc if p1(x)=='5')
+    seis = [x for x in acc if p1(x)=='6']
+    dep = sum(x['d']-x['h'] for x in seis if x['g'] in DEP)
+    gas = sum(x['d']-x['h'] for x in seis) - dep
+    fin = sum(x['d']-x['h'] for x in acc if p1(x)=='7')
+    uai = ing-cos-gas-dep-fin
+    er = dict(ing=ing, cos=cos, ub=ing-cos, gas=gas, dep=dep, fin=fin, uai=uai)
+    # ---- firmas ----
     ssf = lambda x: x['sf'] if x['nat']=='D' else -x['sf']
+    def ce(x):
+        delta = x['sf']-x['si']; return -delta if x['nat']=='D' else delta
     res_ytd = -sum(ssf(x) for x in acc if p1(x) in ('4','5','6','7'))
-    activo  = sum(ssf(x) for x in acc if p1(x)=='1')
-    pasivo  = sum(-ssf(x) for x in acc if p1(x)=='2')
-    cap_cta = sum(-ssf(x) for x in acc if p1(x)=='3')
-    capital = cap_cta + res_ytd
-    bg = dict(activo=activo, pasivo=pasivo, cap_cta=cap_cta, res=res_ytd,
-              capital=capital, residual=activo-(pasivo+capital))
-    # --- EFE (indirecto) ---
+    # ---- Balance General por partida (3 dígitos) ----
+    saldo_g = defaultdict(float)
+    for x in acc:
+        if p1(x) in ('1','2','3'): saldo_g[x['g']] += ssf(x)
+    def bg_lineas(cond, signo):
+        return sorted([(_lbl(g), signo*v) for g,v in saldo_g.items() if cond(g) and abs(v)>=1],
+                      key=lambda t:-abs(t[1]))
+    act_circ   = bg_lineas(lambda g: g[:1]=='1' and g < '150', 1)
+    act_nocirc = bg_lineas(lambda g: g[:1]=='1' and g >= '150', 1)
+    pas_cp     = bg_lineas(lambda g: g[:1]=='2' and g < '250', -1)
+    pas_lp     = bg_lineas(lambda g: g[:1]=='2' and g >= '250', -1)
+    cap        = bg_lineas(lambda g: g[:1]=='3', -1)
+    cap.append(('Resultado del ejercicio', res_ytd))
+    tot_act = sum(v for g,v in saldo_g.items() if g[:1]=='1')
+    tot_pas = sum(-v for g,v in saldo_g.items() if g[:1]=='2')
+    tot_cap = sum(-v for g,v in saldo_g.items() if g[:1]=='3') + res_ytd
+    bg = dict(act_circ=act_circ, act_nocirc=act_nocirc, pas_cp=pas_cp, pas_lp=pas_lp, cap=cap,
+              tot_act=tot_act, tot_pas=tot_pas, tot_cap=tot_cap, residual=tot_act-(tot_pas+tot_cap))
+    # ---- EFE por partida (clasifica por agrupador completo, presenta por 3 dígitos) ----
     def actividad(ag):
         if ag[:3] in ('101','102','103'): return 'EF'
         if ag.startswith(('202.01','205.06','107.05','251','252','253','254','255','256','257','258','259',
@@ -297,21 +334,24 @@ def estados_financieros(archivo_id):
         if ag[:1] in ('1','2'): return 'OP'
         if ag[:1]=='3': return 'FIN'
         return 'OTRO'
-    def ce(x):
-        delta = x['sf']-x['si']; return -delta if x['nat']=='D' else delta
-    bk = {'OP':0.0,'INV':0.0,'FIN':0.0,'OTRO':0.0}
+    efe_acc = defaultdict(float)
     for x in acc:
         if p1(x) in ('4','5','6','7'): continue
         k = actividad(x['ag'])
         if k=='EF': continue
-        bk[k]+=ce(x)
-    operacion = uai + bk['OP']
-    dcash = sum(x['sf']-x['si'] for x in acc if p3(x) in ('101','102','103'))
-    suma = operacion + bk['INV'] + bk['FIN']
-    efe = dict(uai=uai, ct=bk['OP'], op=operacion, inv=bk['INV'], fin=bk['FIN'],
+        efe_acc[(k, _lbl(x['g']))] += ce(x)
+    show = lambda K: sorted([(l,v) for (k,l),v in efe_acc.items() if k==K and abs(v)>=1], key=lambda t:-abs(t[1]))
+    op_l, inv_l, fin_l = show('OP'), show('INV'), show('FIN')
+    op_sum  = sum(v for (k,l),v in efe_acc.items() if k=='OP')
+    inv_tot = sum(v for (k,l),v in efe_acc.items() if k=='INV')
+    fin_tot = sum(v for (k,l),v in efe_acc.items() if k=='FIN')
+    op_tot  = uai + op_sum
+    dcash = sum(x['sf']-x['si'] for x in acc if x['ag'][:3] in ('101','102','103'))
+    suma = op_tot+inv_tot+fin_tot
+    efe = dict(uai=uai, op_l=op_l, inv_l=inv_l, fin_l=fin_l, op_sum=op_sum,
+               op_tot=op_tot, inv_tot=inv_tot, fin_tot=fin_tot,
                suma=suma, dcash=dcash, plug=dcash-suma)
     return dict(er=er, bg=bg, efe=efe)
- 
 # ---------------------------------------------------------------------------
 # INTERFAZ
 # ---------------------------------------------------------------------------
@@ -502,38 +542,65 @@ else:
         if not bal:
             st.error("No se encontró la balanza de ese mes.")
         else:
-            ef = estados_financieros(bal)
-            f = lambda v: f"${v:,.0f}" if v is not None else "—"
-            er, bg, efe = ef["er"], ef["bg"], ef["efe"]
-            ingp = (lambda d: f" ({d/er['ing']*100:.1f}%)" if er['ing'] else "")
+            ef = estados_financieros(bal); er, bg, efe = ef["er"], ef["bg"], ef["efe"]
+            def _f(v):
+                if v is None: return "—"
+                return ("(${:,.0f})".format(abs(v))) if v < 0 else "${:,.0f}".format(v)
+            pct = lambda v: (" ({:.1f}%)".format(v/er['ing']*100)) if er['ing'] else ""
  
-            st.markdown(f"#### Estado de Resultados · {mes_ef[:7]}")
+            st.markdown("#### Estado de Resultados · " + mes_ef[:7])
             st.markdown(
-                f"| Concepto | Monto |\n|---|--:|\n"
-                f"| Ingresos | {f(er['ing'])} |\n"
-                f"| (−) Costo de ventas | {f(er['cos'])} |\n"
-                f"| **= Utilidad bruta** | **{f(er['ub'])}**{ingp(er['ub'])} |\n"
-                f"| (−) Gastos de operación | {f(er['gas'])} |\n"
-                f"| (−) Depreciación | {f(er['dep'])} |\n"
-                f"| (−) Gasto financiero | {f(er['gf'])} |\n"
-                f"| (+) Producto financiero | {f(er['pf'])} |\n"
-                f"| **= Utilidad antes de impuestos** | **{f(er['uai'])}**{ingp(er['uai'])} |")
+                "| Concepto | Monto |\n|---|--:|\n"
+                "| Ingresos | " + _f(er['ing']) + " |\n"
+                "| (−) Costo de ventas | " + _f(er['cos']) + " |\n"
+                "| **= Utilidad bruta** | **" + _f(er['ub']) + "**" + pct(er['ub']) + " |\n"
+                "| (−) Gastos de operación | " + _f(er['gas']) + " |\n"
+                "| (−) Depreciación | " + _f(er['dep']) + " |\n"
+                "| (−) Resultado financiero neto | " + _f(er['fin']) + " |\n"
+                "| **= Utilidad antes de impuestos** | **" + _f(er['uai']) + "**" + pct(er['uai']) + " |")
  
-            st.markdown(f"#### Balance General · {mes_ef[:7]}")
-            st.markdown(
-                f"| Concepto | Monto |\n|---|--:|\n"
-                f"| ACTIVO | {f(bg['activo'])} |\n"
-                f"| PASIVO | {f(bg['pasivo'])} |\n"
-                f"| Capital (cuentas) | {f(bg['cap_cta'])} |\n"
-                f"| (+) Resultado del ejercicio | {f(bg['res'])} |\n"
-                f"| **= Capital contable** | **{f(bg['capital'])}** |\n"
-                f"| Pasivo + Capital | {f(bg['pasivo']+bg['capital'])} |")
+            st.markdown("#### Balance General · " + mes_ef[:7])
+            filas = ["| Partida | Monto |", "|---|--:|", "| **ACTIVO CIRCULANTE** | |"]
+            for l,v in bg['act_circ']: filas.append("| " + l + " | " + _f(v) + " |")
+            filas.append("| **ACTIVO NO CIRCULANTE** | |")
+            for l,v in bg['act_nocirc']: filas.append("| " + l + " | " + _f(v) + " |")
+            filas.append("| **= Total activo** | **" + _f(bg['tot_act']) + "** |")
+            filas.append("| **PASIVO CORTO PLAZO** | |")
+            for l,v in bg['pas_cp']: filas.append("| " + l + " | " + _f(v) + " |")
+            if bg['pas_lp']:
+                filas.append("| **PASIVO LARGO PLAZO** | |")
+                for l,v in bg['pas_lp']: filas.append("| " + l + " | " + _f(v) + " |")
+            filas.append("| **= Total pasivo** | **" + _f(bg['tot_pas']) + "** |")
+            filas.append("| **CAPITAL CONTABLE** | |")
+            for l,v in bg['cap']: filas.append("| " + l + " | " + _f(v) + " |")
+            filas.append("| **= Total capital** | **" + _f(bg['tot_cap']) + "** |")
+            filas.append("| Pasivo + Capital | " + _f(bg['tot_pas']+bg['tot_cap']) + " |")
+            st.markdown("\n".join(filas))
             if abs(bg['residual']) < 1:
-                st.success(f"Balance cuadrado (residual {f(bg['residual'])}).")
+                st.success("Balance cuadrado (residual " + _f(bg['residual']) + ").")
             else:
-                st.warning(f"Residual de cuadre: {f(bg['residual'])} — saldos desfasados (revisar R-EC-10 / naturaleza).")
+                st.warning("Residual de cuadre: " + _f(bg['residual']) + " — saldos desfasados (revisar R-EC-10 / naturaleza).")
  
-            st.markdown(f"#### Estado de Flujo de Efectivo · {mes_ef[:7]} (indirecto)")
+            st.markdown("#### Estado de Flujo de Efectivo · " + mes_ef[:7] + " (indirecto)")
+            fil = ["| Concepto | Monto |", "|---|--:|", "| **OPERACIÓN** | |",
+                   "| Utilidad antes de impuestos | " + _f(efe['uai']) + " |"]
+            for l,v in efe['op_l']: fil.append("| Δ " + l + " | " + _f(v) + " |")
+            fil.append("| **= Flujo de operación** | **" + _f(efe['op_tot']) + "** |")
+            fil.append("| **INVERSIÓN** | |")
+            for l,v in efe['inv_l']: fil.append("| Δ " + l + " | " + _f(v) + " |")
+            fil.append("| **= Flujo de inversión** | **" + _f(efe['inv_tot']) + "** |")
+            fil.append("| **FINANCIAMIENTO** | |")
+            for l,v in efe['fin_l']: fil.append("| Δ " + l + " | " + _f(v) + " |")
+            fil.append("| **= Flujo de financiamiento** | **" + _f(efe['fin_tot']) + "** |")
+            fil.append("| **= Variación de caja calculada** | **" + _f(efe['suma']) + "** |")
+            fil.append("| Variación real de caja | " + _f(efe['dcash']) + " |")
+            fil.append("| Partida por identificar | " + _f(efe['plug']) + " |")
+            st.markdown("\n".join(fil))
+            if abs(efe['plug']) < 1:
+                st.success("EFE cuadrado (partida por identificar $0).")
+            else:
+                st.warning("Partida por identificar: " + _f(efe['plug']) + " — clasificación incompleta.")
+ 
             st.markdown(
                 f"| Concepto | Monto |\n|---|--:|\n"
                 f"| Utilidad antes de impuestos | {f(efe['uai'])} |\n"
