@@ -345,11 +345,14 @@ def estados_financieros(archivo_id):
     inv_tot = sum(v for (k,g),v in efe_acc.items() if k=='INV')
     fin_tot = sum(v for (k,g),v in efe_acc.items() if k=='FIN')
     op_tot  = uai + op_sum
-    dcash = sum(x['sf']-x['si'] for x in acc if x['ag'][:3] in ('101','102','103'))
+    efec_ini = sum(x['si'] for x in acc if x['ag'][:3] in ('101','102','103'))
+    efec_fin = sum(x['sf'] for x in acc if x['ag'][:3] in ('101','102','103'))
+    dcash = efec_fin - efec_ini
     suma = op_tot+inv_tot+fin_tot
     efe = dict(uai=uai, op_l=op_l, inv_l=inv_l, fin_l=fin_l, op_sum=op_sum,
                op_tot=op_tot, inv_tot=inv_tot, fin_tot=fin_tot,
-               suma=suma, dcash=dcash, plug=dcash-suma)
+               suma=suma, dcash=dcash, efec_ini=efec_ini, efec_fin=efec_fin,
+               plug=efec_fin-(efec_ini+suma))
     return dict(er=er, bg=bg, efe=efe)
 # ---------------------------------------------------------------------------
 # INTERFAZ
@@ -591,12 +594,13 @@ else:
             fil.append("| **FINANCIAMIENTO** | |")
             for l,v in efe['fin_l']: fil.append("| Δ " + l + " | " + _f(v) + " |")
             fil.append("| **= Flujo de financiamiento** | **" + _f(efe['fin_tot']) + "** |")
-            fil.append("| **= Variación de caja calculada** | **" + _f(efe['suma']) + "** |")
-            fil.append("| Variación real de caja | " + _f(efe['dcash']) + " |")
+            fil.append("| **= Variación neta de efectivo** | **" + _f(efe['suma']) + "** |")
+            fil.append("| (+) Efectivo y equivalentes al inicio | " + _f(efe['efec_ini']) + " |")
+            fil.append("| **= Efectivo y equivalentes al final (calculado)** | **" + _f(efe['efec_ini']+efe['suma']) + "** |")
+            fil.append("| Efectivo y equivalentes al final (real, Caja + Bancos) | " + _f(efe['efec_fin']) + " |")
             fil.append("| Partida por identificar | " + _f(efe['plug']) + " |")
             st.markdown("\n".join(fil))
             if abs(efe['plug']) < 1:
                 st.success("EFE cuadrado (partida por identificar $0).")
             else:
                 st.warning("Partida por identificar: " + _f(efe['plug']) + " — clasificación incompleta.")
- 
