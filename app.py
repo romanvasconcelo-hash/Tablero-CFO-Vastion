@@ -312,8 +312,7 @@ def estados_financieros(archivo_id):
     for x in acc:
         if p1(x) in ('1','2','3'): saldo_g[x['g']] += ssf(x)
     def bg_lineas(cond, signo):
-        return sorted([(_lbl(g), signo*v) for g,v in saldo_g.items() if cond(g) and abs(v)>=1],
-                      key=lambda t:-abs(t[1]))
+        return [(_lbl(g), signo*v) for g,v in sorted(saldo_g.items()) if cond(g) and abs(v)>=1]
     act_circ   = bg_lineas(lambda g: g[:1]=='1' and g < '150', 1)
     act_nocirc = bg_lineas(lambda g: g[:1]=='1' and g >= '150', 1)
     pas_cp     = bg_lineas(lambda g: g[:1]=='2' and g < '250', -1)
@@ -339,12 +338,12 @@ def estados_financieros(archivo_id):
         if p1(x) in ('4','5','6','7'): continue
         k = actividad(x['ag'])
         if k=='EF': continue
-        efe_acc[(k, _lbl(x['g']))] += ce(x)
-    show = lambda K: sorted([(l,v) for (k,l),v in efe_acc.items() if k==K and abs(v)>=1], key=lambda t:-abs(t[1]))
+        efe_acc[(k, x['g'])] += ce(x)
+    show = lambda K: [(_lbl(g), v) for (k,g),v in sorted(efe_acc.items()) if k==K and abs(v)>=1]
     op_l, inv_l, fin_l = show('OP'), show('INV'), show('FIN')
-    op_sum  = sum(v for (k,l),v in efe_acc.items() if k=='OP')
-    inv_tot = sum(v for (k,l),v in efe_acc.items() if k=='INV')
-    fin_tot = sum(v for (k,l),v in efe_acc.items() if k=='FIN')
+    op_sum  = sum(v for (k,g),v in efe_acc.items() if k=='OP')
+    inv_tot = sum(v for (k,g),v in efe_acc.items() if k=='INV')
+    fin_tot = sum(v for (k,g),v in efe_acc.items() if k=='FIN')
     op_tot  = uai + op_sum
     dcash = sum(x['sf']-x['si'] for x in acc if x['ag'][:3] in ('101','102','103'))
     suma = op_tot+inv_tot+fin_tot
@@ -601,21 +600,3 @@ else:
             else:
                 st.warning("Partida por identificar: " + _f(efe['plug']) + " — clasificación incompleta.")
  
-            st.markdown(
-                f"| Concepto | Monto |\n|---|--:|\n"
-                f"| Utilidad antes de impuestos | {f(efe['uai'])} |\n"
-                f"| (+/−) Cambios en capital de trabajo | {f(efe['ct'])} |\n"
-                f"| **= Flujo de operación** | **{f(efe['op'])}** |\n"
-                f"| Flujo de inversión | {f(efe['inv'])} |\n"
-                f"| Flujo de financiamiento | {f(efe['fin'])} |\n"
-                f"| **= Variación de caja calculada** | **{f(efe['suma'])}** |\n"
-                f"| Variación real de caja | {f(efe['dcash'])} |\n"
-                f"| Partida por identificar | {f(efe['plug'])} |")
-            if abs(efe['plug']) < 1:
-                st.success("EFE cuadrado (partida por identificar $0).")
-            else:
-                st.warning(f"Partida por identificar: {f(efe['plug'])} — clasificación incompleta.")
-            st.text_area("Lectura del mes", key="rep_lectura",
-                         placeholder="Ej.: El negocio es rentable, pero la utilidad se quedó en cobranza. Prioridad: cobrar, no vender.",
-                         label_visibility="collapsed")
-            st.caption("Los números los pone el sistema. La lectura la escribe el CFO.")
