@@ -1,3 +1,4 @@
+
 # ============================================================================
 # TABLERO CFO VASTION · App de Roberto  v0.3
 # Carga + validación + REPORTE INTERNO de indicadores.
@@ -280,17 +281,30 @@ def estados_financieros(archivo_id):
     try:
         cur.execute("""
             SELECT i.cod_agrupador, i.naturaleza::text, i.saldo_final,
-                   r.saldo_inicial, r.debe, r.haber
+                   r.saldo_inicial, r.debe, r.haber, i.num_cuenta
             FROM insumos_balanza i
             JOIN raw_balanza r ON r.archivo_id=i.archivo_id AND r.num_cuenta=i.num_cuenta
             WHERE i.archivo_id=%s AND i.es_hoja AND NOT i.es_orden
         """, (archivo_id,))
         rows = cur.fetchall()
+        cur.execute("SELECT cliente_id, periodo FROM insumos_balanza WHERE archivo_id=%s LIMIT 1", (archivo_id,))
+        meta = cur.fetchone()
+        ystart = {}
+        if meta:
+            import datetime as _dt
+            cur.execute("SELECT archivo_vigente FROM periodo_estado WHERE cliente_id=%s AND periodo=%s",
+                        (meta[0], _dt.date(meta[1].year, 1, 1)))
+            _en = cur.fetchone()
+            if _en and _en[0]:
+                cur.execute("SELECT num_cuenta, saldo_inicial FROM raw_balanza WHERE archivo_id=%s", (_en[0],))
+                ystart = {nc: float(s2 or 0) for nc, s2 in cur.fetchall()}
     finally:
         cur.close(); conn.close()
     acc = [dict(ag=(a or ''), g=(a or '')[:3], nat=(n or ''), sf=float(sf or 0),
-                si=float(si or 0), d=float(d or 0), h=float(h or 0))
-           for a,n,sf,si,d,h in rows]
+                si=float(si or 0), d=float(d or 0), h=float(h or 0), num=nc)
+           for a,n,sf,si,d,h,nc in rows]
+    def _yst(x):
+        return ystart.get(x['num'], 0.0) if ystart else x['si']
     p1 = lambda x: x['ag'][:1]
     DEP = ('159','171','172','613','614')
     # ---- Estado de Resultados (todo 4/5/6/7) ----
@@ -305,8 +319,16 @@ def estados_financieros(archivo_id):
     # ---- firmas ----
     ssf = lambda x: x['sf'] if x['nat']=='D' else -x['sf']
     def ce(x):
-        delta = x['sf']-x['si']; return -delta if x['nat']=='D' else delta
+        delta = x['sf']-_yst(x); return -delta if x['nat']=='D' else delta
     res_ytd = -sum(ssf(x) for x in acc if p1(x) in ('4','5','6','7'))
+    ing_y = -sum(ssf(x) for x in acc if p1(x)=='4')
+    cos_y = sum(ssf(x) for x in acc if p1(x)=='5')
+    seis_y = [x for x in acc if p1(x)=='6']
+    dep_y = sum(ssf(x) for x in seis_y if x['g'] in DEP)
+    gas_y = sum(ssf(x) for x in seis_y) - dep_y
+    fin_y = sum(ssf(x) for x in acc if p1(x)=='7')
+    ebit_y = ing_y - cos_y - gas_y - dep_y
+    ytd = dict(ing=ing_y, cos=cos_y, ub=ing_y-cos_y, gas=gas_y, dep=dep_y, fin=fin_y, ebit=ebit_y, uai=ebit_y-fin_y)
     # ---- Balance General por partida (3 dígitos) ----
     saldo_g = defaultdict(float)
     for x in acc:
@@ -345,17 +367,37 @@ def estados_financieros(archivo_id):
     op_sum  = sum(v for (k,g),v in efe_acc.items() if k=='OP')
     inv_tot = sum(v for (k,g),v in efe_acc.items() if k=='INV')
     fin_tot = sum(v for (k,g),v in efe_acc.items() if k=='FIN')
-    op_tot  = uai + op_sum
-    efec_ini = sum(x['si'] for x in acc if x['ag'][:3] in ('101','102','103'))
+    op_tot  = ytd['uai'] + op_sum
+    efec_ini = sum(_yst(x) for x in acc if x['ag'][:3] in ('101','102','103'))
     efec_fin = sum(x['sf'] for x in acc if x['ag'][:3] in ('101','102','103'))
     dcash = efec_fin - efec_ini
     suma = op_tot+inv_tot+fin_tot
-    efe = dict(uai=uai, op_l=op_l, inv_l=inv_l, fin_l=fin_l, op_sum=op_sum,
+    efe = dict(uai=ytd['uai'], op_l=op_l, inv_l=inv_l, fin_l=fin_l, op_sum=op_sum,
                op_tot=op_tot, inv_tot=inv_tot, fin_tot=fin_tot,
                suma=suma, dcash=dcash, efec_ini=efec_ini, efec_fin=efec_fin,
                plug=efec_fin-(efec_ini+suma),
                acc={("%s|%s" % (k, g)): v for (k, g), v in efe_acc.items()})
-    return dict(er=er, bg=bg, efe=efe)
+    # ---- ISR provisional: cuenta contable, agrupador 114 "Pagos provisionales" (leído de balanza) ----
+    AG_ISR_PROV = '114'
+    isr_prov = sum(x['sf'] for x in acc if x['g'] == AG_ISR_PROV)
+    ytd['isr_prov'] = isr_prov
+    ytd['un'] = ytd['uai'] - isr_prov
+    # ---- Generador de Efectivo (Cash Effectiveness, Alexander) · YTD ----
+    def _sg(v, nat): return v if nat == 'D' else -v
+    def _dssf(x): return _sg(x['sf'], x['nat']) - _sg(_yst(x), x['nat'])
+    capex = sum(_dssf(x) for x in acc
+                if '150' <= x['g'] <= '184' and x['g'] not in ('159', '171', '172'))
+    def _es_opcap(x):
+        cur_act = x['g'][:1] == '1' and x['g'] < '150'
+        cur_pas = x['g'][:1] == '2' and x['g'] < '250'
+        return (cur_act or cur_pas) and actividad(x['ag']) == 'OP'
+    opcap     = sum(_sg(x['sf'],   x['nat']) for x in acc if _es_opcap(x))
+    opcap_ini = sum(_sg(_yst(x),   x['nat']) for x in acc if _es_opcap(x))
+    dopcap = opcap - opcap_ini
+    generador = ytd['uai'] + ytd['dep'] - capex - dopcap
+    cash = dict(uai=ytd['uai'], dep=ytd['dep'], capex=capex, opcap=opcap, opcap_ini=opcap_ini,
+                dopcap=dopcap, generador=generador, isr_prov=isr_prov, un=ytd['un'])
+    return dict(er=er, bg=bg, efe=efe, ytd=ytd, cash=cash)
  
 def _fmt(v):
     if v is None: return "—"
@@ -397,11 +439,12 @@ def _bg_sec(g):
     return ('Capital contable', -1)
  
 def er_rows_cmp(ef_a, ef_p):
-    p = ef_p['er'] if ef_p else {}
+    A = ef_a['ytd']; p = ef_p['ytd'] if ef_p else {}
     L = [('Ingresos','ing',False),('(−) Costo de ventas','cos',False),('= Utilidad bruta','ub',True),
          ('(−) Gastos de operación','gas',False),('(−) Depreciación','dep',False),
+         ('= Utilidad de operación (EBIT)','ebit',True),
          ('(−) Resultado financiero neto','fin',False),('= Utilidad antes de impuestos','uai',True)]
-    return [(lbl, ef_a['er'][k], p.get(k), b) for lbl, k, b in L]
+    return [(lbl, A.get(k), p.get(k), b) for lbl, k, b in L]
  
 def bg_rows_cmp(ef_a, ef_p):
     sa = ef_a['bg']['saldo_g']; sp = ef_p['bg']['saldo_g'] if ef_p else {}
@@ -448,11 +491,118 @@ def efe_rows_cmp(ef_a, ef_p):
         tk = {'OP':'op_tot','INV':'inv_tot','FIN':'fin_tot'}[code]
         rows.append(('= ' + sec.replace('FLUJO DE ','Flujo de ').lower().capitalize(), ef_a['efe'][tk], P.get(tk), True))
     rows.append(('= Variación neta de efectivo', ef_a['efe']['suma'], P.get('suma'), True))
-    rows.append(('(+) Efectivo al inicio', ef_a['efe']['efec_ini'], P.get('efec_ini'), False))
+    rows.append(('(+) Efectivo al inicio del ejercicio', ef_a['efe']['efec_ini'], P.get('efec_ini'), False))
     rows.append(('= Efectivo al final (calculado)', ef_a['efe']['efec_ini']+ef_a['efe']['suma'],
                  ((P.get('efec_ini') or 0)+(P.get('suma') or 0)) if ef_p else None, True))
     rows.append(('Efectivo al final (real, Caja + Bancos)', ef_a['efe']['efec_fin'], P.get('efec_fin'), False))
     return rows
+ 
+ 
+def _fr(v, fmt):
+    if v is None: return "—"
+    if fmt == 'pct':   return "{:.1f}%".format(v*100)
+    if fmt == 'dias':  return "{:,.0f} días".format(v)
+    if fmt == 'veces': return "{:.2f}x".format(v)
+    if fmt == 'pesos': return _fmt(v)
+    return "{:.2f}".format(v)
+ 
+def _fvar(va, vp, fmt):
+    if va is None or vp is None: return "—"
+    d = va - vp
+    if fmt == 'pct':   return "{:+.1f} pp".format(d*100)
+    if fmt == 'dias':  return "{:+,.0f} días".format(d)
+    if fmt == 'veces': return "{:+.2f}x".format(d)
+    if fmt == 'pesos': return _fmt(d)
+    return "{:+.2f}".format(d)
+ 
+def _stocks_de(ef):
+    sg = ef['bg']['saldo_g']
+    act_circ = sum(v for c,v in sg.items() if c[:1]=='1' and c < '150')
+    pas_circ = sum(-v for c,v in sg.items() if c[:1]=='2' and c < '250')
+    cxc = sg.get('105',0) + sg.get('106',0)
+    inv = sg.get('115',0)+sg.get('116',0)+sg.get('117',0)+sg.get('121',0)
+    cxp = -sg.get('201',0)
+    afn = sum(v for c,v in sg.items() if '150' <= c < '180')
+    return dict(act_circ=act_circ, pas_circ=pas_circ, cxc=cxc, inv=inv, cxp=cxp, afn=afn,
+                activo=ef['bg']['tot_act'], pasivo=ef['bg']['tot_pas'], capital=ef['bg']['tot_cap'])
+ 
+def ratios_mensuales(cli, periodo):
+    import datetime
+    sd = lambda a,b: (a/b) if b else None
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT periodo, archivo_vigente FROM periodo_estado WHERE cliente_id=%s AND archivo_vigente IS NOT NULL ORDER BY periodo", (cli,))
+        rowsp = cur.fetchall()
+    finally:
+        cur.close(); conn.close()
+    pers = [str(p) for p,_ in rowsp]; arch = {str(p): a for p,a in rowsp}
+    if periodo not in pers: return None
+    cache = {}
+    def ef_de(idx):
+        if idx < 0 or idx >= len(pers): return None
+        per = pers[idx]
+        if per not in cache: cache[per] = estados_financieros(arch[per])
+        return cache[per]
+    def dias_ytd(per):
+        y,m = int(per[:4]), int(per[5:7])
+        d = datetime.date(y,12,31) if m==12 else datetime.date(y,m+1,1)-datetime.timedelta(days=1)
+        return d.timetuple().tm_yday
+    def snap(idx):
+        ef = ef_de(idx)
+        if ef is None: return None
+        ytd = ef['ytd']; st = _stocks_de(ef); per = pers[idx]
+        ing=ytd['ing']; cos=ytd['cos']; gas=ytd['gas']; dep=ytd['dep']; fin=ytd['fin']; ebit=ytd['ebit']; uai=ytd['uai']; un=ytd['un']; cash=ef['cash']
+        dias = dias_ytd(per)
+        efp = ef_de(idx-1)
+        crec = (ef['er']['ing']/efp['er']['ing'] - 1) if (efp and efp['er']['ing']) else None
+        dso = sd(st['cxc'], ing); dso = dso*dias if dso is not None else None
+        dio = sd(st['inv'], cos); dio = dio*dias if dio is not None else None
+        dpo = sd(st['cxp'], cos); dpo = dpo*dias if dpo is not None else None
+        cce = (dso+dio-dpo) if None not in (dso,dio,dpo) else None
+        wc = st['act_circ'] - st['pas_circ']
+        return [
+            ('1. Evaluación Operativa','Crecimiento en ingresos (MoM)', crec, 'pct'),
+            ('1. Evaluación Operativa','Margen de utilidad bruta', sd(ing-cos,ing), 'pct'),
+            ('1. Evaluación Operativa','Margen de gastos de operación', sd(gas,ing), 'pct'),
+            ('1. Evaluación Operativa','Margen de utilidad operativa (EBIT)', sd(ebit,ing), 'pct'),
+            ('1. Evaluación Operativa','Margen de utilidad antes de impuestos', sd(uai,ing), 'pct'),
+            ('1. Evaluación Operativa','Margen de utilidad neta', sd(un,ing), 'pct'),
+            ('1. Evaluación Operativa','Utilidad antes de impuestos (UAI)', uai, 'pesos'),
+            ('1. Evaluación Operativa','(−) ISR provisional (cuenta 114)', cash['isr_prov'], 'pesos'),
+            ('1. Evaluación Operativa','Utilidad neta', un, 'pesos'),
+            ('2. Uso de Activos','Días cuentas por cobrar (DSO)', dso, 'dias'),
+            ('2. Uso de Activos','Rotación de inventario', sd(cos, st['inv']), 'veces'),
+            ('2. Uso de Activos','Días de inventario (DIO)', dio, 'dias'),
+            ('2. Uso de Activos','Días cuentas por pagar (DPO)', dpo, 'dias'),
+            ('2. Uso de Activos','Ciclo de conversión de efectivo', cce, 'dias'),
+            ('2. Uso de Activos','Capital de trabajo', wc, 'pesos'),
+            ('2. Uso de Activos','Capital de trabajo / Ingresos', sd(wc, ing), 'pct'),
+            ('2. Uso de Activos','Rotación de activos fijos', sd(ing, st['afn']), 'veces'),
+            ('2. Uso de Activos','Rotación de activo total', sd(ing, st['activo']), 'veces'),
+            ('3. Estructura de Capital y Liquidez','Liquidez (razón corriente)', sd(st['act_circ'], st['pas_circ']), 'veces'),
+            ('3. Estructura de Capital y Liquidez','Liquidez inmediata (prueba ácida)', sd(st['act_circ']-st['inv'], st['pas_circ']), 'veces'),
+            ('3. Estructura de Capital y Liquidez','Deuda / Capitalización', sd(st['pasivo'], st['pasivo']+st['capital']), 'pct'),
+            ('3. Estructura de Capital y Liquidez','Deuda / Capital contable', sd(st['pasivo'], st['capital']), 'veces'),
+            ('3. Estructura de Capital y Liquidez','Cobertura de intereses', sd(ebit, fin), 'veces'),
+            ('4. Rentabilidad','Retorno sobre activos (ROA)', sd(un, st['activo']), 'pct'),
+            ('4. Rentabilidad','Retorno sobre capital (ROE)', sd(un, st['capital']), 'pct'),
+            ('4. Rentabilidad','DuPont — Margen neto', sd(un,ing), 'pct'),
+            ('4. Rentabilidad','DuPont — Rotación de activo', sd(ing, st['activo']), 'veces'),
+            ('4. Rentabilidad','DuPont — Apalancamiento (Activo/Capital)', sd(st['activo'], st['capital']), 'veces'),
+            ('4. Rentabilidad','DuPont — ROE (producto)',
+                ((sd(un,ing) or 0)*(sd(ing,st['activo']) or 0)*(sd(st['activo'],st['capital']) or 0)) if st['capital'] else None, 'pct'),
+            ('4. Rentabilidad','ROIC (ROCE de libro)', sd(ebit, st['activo']-st['pas_circ']), 'pct'),
+            ('5. Generador de Efectivo','Utilidad antes de impuestos', cash['uai'], 'pesos'),
+            ('5. Generador de Efectivo','(+) Depreciación y amortización', cash['dep'], 'pesos'),
+            ('5. Generador de Efectivo','(−) Gastos de capital (CapEx)', cash['capex'], 'pesos'),
+            ('5. Generador de Efectivo','(−) Incremento de capital operativo', cash['dopcap'], 'pesos'),
+            ('5. Generador de Efectivo','= Generador de efectivo (YTD)', cash['generador'], 'pesos'),
+            ('5. Generador de Efectivo','Generador de efectivo / Ingresos', sd(cash['generador'], ing), 'pct'),
+            ('5. Generador de Efectivo','Capital operativo (posición)', cash['opcap'], 'pesos'),
+            ('5. Generador de Efectivo','Capital de trabajo (posición, referencia)', wc, 'pesos'),
+        ]
+    iM = pers.index(periodo)
+    return snap(iM), snap(iM-1), (pers[iM-1] if iM > 0 else None)
  
 # ---------------------------------------------------------------------------
 # INTERFAZ
@@ -628,7 +778,7 @@ else:
 # ---------------------------------------------------------------------------
 st.divider()
 st.subheader("Estados financieros formales (NIF) — Reporte Mensual")
-st.caption("Respaldo formal del reporte. Para clientes con observaciones, son diagnóstico interno hasta la recontabilización.")
+st.caption("ER y EFE en acumulado del ejercicio (YTD); Balance en posición del mes. Para clientes con observaciones, son diagnóstico hasta la recontabilización.")
 _pf = periodos_cargados(cli_id)
 if not _pf:
     st.caption("Carga al menos un mes para generar los estados financieros.")
@@ -647,32 +797,33 @@ else:
             ca = mes_ef[:7]
             if comparar:
                 cp = per_p
-                st.markdown("#### Estado de Resultados · " + ca + " vs " + cp)
+                st.markdown("#### Estado de Resultados · " + ca + " vs " + cp + " (acumulado)")
                 st.markdown(_cmp_md(er_rows_cmp(ef_a, ef_p), ca, cp))
                 st.markdown("#### Balance General · " + ca + " vs " + cp)
                 st.markdown(_cmp_md(bg_rows_cmp(ef_a, ef_p), ca, cp))
                 rsd = ef_a["bg"]["residual"]
                 if abs(rsd) < 1: st.success("Balance del mes cuadrado (residual " + _fmt(rsd) + ").")
                 else: st.warning("Residual de cuadre del mes: " + _fmt(rsd) + ".")
-                st.markdown("#### Estado de Flujo de Efectivo · " + ca + " vs " + cp + " (indirecto)")
+                st.markdown("#### Estado de Flujo de Efectivo · " + ca + " vs " + cp + " (indirecto, acumulado)")
                 st.markdown(_cmp_md(efe_rows_cmp(ef_a, ef_p), ca, cp))
                 plg = ef_a["efe"]["plug"]
                 if abs(plg) < 1: st.success("EFE del mes cuadrado (partida por identificar $0).")
                 else: st.warning("Partida por identificar del mes: " + _fmt(plg) + ".")
                 st.caption("La columna Variación es el cambio de cada cuenta entre los dos meses — el mismo insumo que alimenta el flujo de efectivo.")
             else:
-                er, bg, efe = ef_a["er"], ef_a["bg"], ef_a["efe"]
+                er = ef_a["ytd"]; bg = ef_a["bg"]; efe = ef_a["efe"]
                 pct = lambda v: (" ({:.1f}%)".format(v/er["ing"]*100)) if er["ing"] else ""
-                st.markdown("#### Estado de Resultados · " + ca)
-                st.markdown(
-                    "| Concepto | Monto |\n|---|--:|\n"
-                    "| Ingresos | " + _fmt(er["ing"]) + " |\n"
-                    "| (−) Costo de ventas | " + _fmt(er["cos"]) + " |\n"
-                    "| **= Utilidad bruta** | **" + _fmt(er["ub"]) + "**" + pct(er["ub"]) + " |\n"
-                    "| (−) Gastos de operación | " + _fmt(er["gas"]) + " |\n"
-                    "| (−) Depreciación | " + _fmt(er["dep"]) + " |\n"
-                    "| (−) Resultado financiero neto | " + _fmt(er["fin"]) + " |\n"
-                    "| **= Utilidad antes de impuestos** | **" + _fmt(er["uai"]) + "**" + pct(er["uai"]) + " |")
+                st.markdown("#### Estado de Resultados · " + ca + " (acumulado del ejercicio)")
+                _er = ["| Concepto | Monto |", "|---|--:|",
+                       "| Ingresos | " + _fmt(er["ing"]) + " |",
+                       "| (−) Costo de ventas | " + _fmt(er["cos"]) + " |",
+                       "| **= Utilidad bruta** | **" + _fmt(er["ub"]) + "**" + pct(er["ub"]) + " |",
+                       "| (−) Gastos de operación | " + _fmt(er["gas"]) + " |",
+                       "| (−) Depreciación | " + _fmt(er["dep"]) + " |",
+                       "| **= Utilidad de operación (EBIT)** | **" + _fmt(er["ebit"]) + "**" + pct(er["ebit"]) + " |",
+                       "| (−) Resultado financiero neto | " + _fmt(er["fin"]) + " |",
+                       "| **= Utilidad antes de impuestos** | **" + _fmt(er["uai"]) + "**" + pct(er["uai"]) + " |"]
+                st.markdown(chr(10).join(_er))
                 filas = ["| Partida | Monto |", "|---|--:|", "| **ACTIVO CIRCULANTE** | |"]
                 for l,v in bg["act_circ"]: filas.append("| " + l + " | " + _fmt(v) + " |")
                 filas.append("| **ACTIVO NO CIRCULANTE** | |")
@@ -703,12 +854,43 @@ else:
                 for l,v in efe["fin_l"]: fil.append("| Δ " + l + " | " + _fmt(v) + " |")
                 fil.append("| **= Flujo de financiamiento** | **" + _fmt(efe["fin_tot"]) + "** |")
                 fil.append("| **= Variación neta de efectivo** | **" + _fmt(efe["suma"]) + "** |")
-                fil.append("| (+) Efectivo y equivalentes al inicio | " + _fmt(efe["efec_ini"]) + " |")
+                fil.append("| (+) Efectivo y equivalentes al inicio del ejercicio | " + _fmt(efe["efec_ini"]) + " |")
                 fil.append("| **= Efectivo y equivalentes al final (calculado)** | **" + _fmt(efe["efec_ini"]+efe["suma"]) + "** |")
                 fil.append("| Efectivo y equivalentes al final (real, Caja + Bancos) | " + _fmt(efe["efec_fin"]) + " |")
                 fil.append("| Partida por identificar | " + _fmt(efe["plug"]) + " |")
-                st.markdown("#### Estado de Flujo de Efectivo · " + ca + " (indirecto)")
+                st.markdown("#### Estado de Flujo de Efectivo · " + ca + " (indirecto, acumulado del ejercicio)")
                 st.markdown("\n".join(fil))
                 if abs(efe["plug"]) < 1: st.success("EFE cuadrado (partida por identificar $0).")
                 else: st.warning("Partida por identificar: " + _fmt(efe["plug"]) + ".")
  
+ 
+# ---------------------------------------------------------------------------
+# RATIOS FINANCIEROS MENSUALES (Alexander) - REPORTE MENSUAL
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Ratios financieros mensuales — Reporte Mensual")
+st.caption("Base: acumulado del año a la fecha (YTD), sin anualizar. Los días reflejan los días transcurridos del año.")
+_pr = periodos_cargados(cli_id)
+if not _pr:
+    st.caption("Carga al menos un mes para calcular ratios.")
+else:
+    mes_r = st.selectbox("Mes", _pr, key="rat_mes")
+    if st.button("Calcular ratios"):
+        out = ratios_mensuales(cli_id, mes_r)
+        if out is None:
+            st.error("No se encontró ese mes.")
+        else:
+            a_rows, p_rows, per_p = out
+            pmap = {(s,l):(v,f) for s,l,v,f in p_rows} if p_rows else {}
+            ca = mes_r[:7]; cp = per_p[:7] if per_p else "—"
+            sec_actual = None; tabla = []
+            for s,l,v,f in a_rows:
+                if s != sec_actual:
+                    if tabla:
+                        st.markdown("\n".join(tabla)); tabla = []
+                    st.markdown("##### " + s)
+                    tabla = ["| Ratio | " + ca + " | " + cp + " | Variación |", "|---|--:|--:|--:|"]
+                    sec_actual = s
+                vp = pmap.get((s,l),(None,f))[0]
+                tabla.append("| " + l + " | " + _fr(v,f) + " | " + _fr(vp,f) + " | " + _fvar(v,vp,f) + " |")
+            if tabla: st.markdown("\n".join(tabla))
