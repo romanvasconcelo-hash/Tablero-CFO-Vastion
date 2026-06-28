@@ -1,4 +1,3 @@
-
 # ============================================================================
 # TABLERO CFO VASTION · App de Roberto  v0.3
 # Carga + validación + REPORTE INTERNO de indicadores.
@@ -197,6 +196,82 @@ def sem_pretax(p):
  
 def money(v):
     return "—" if v is None else f"${v:,.0f}"
+ 
+ 
+def pdf_reporte_cliente(nombre, periodo, ind, lectura):
+    """Reporte CFO mensual del cliente en PDF (una página). Caja al centro."""
+    from fpdf import FPDF
+    def t(s):
+        return str(s).encode('latin-1', 'replace').decode('latin-1')
+    def m(v):
+        return money(v) if v is not None else "s/d"
+    W, Mg = 210, 16
+    CW = W - 2 * Mg
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=16)
+    pdf.add_page()
+ 
+    pdf.set_fill_color(28, 45, 58)
+    pdf.rect(0, 0, W, 30, style="F")
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_xy(Mg, 8);  pdf.set_font("Helvetica", "B", 18); pdf.cell(CW, 8, t("Reporte CFO Mensual"))
+    pdf.set_xy(Mg, 18); pdf.set_font("Helvetica", "", 11);  pdf.cell(CW, 6, t(nombre + "   |   " + periodo))
+ 
+    pdf.set_text_color(44, 62, 80)
+    pdf.set_xy(Mg, 40); pdf.set_font("Helvetica", "", 11); pdf.cell(CW, 6, t("Tu caja al cierre del mes"))
+    pdf.set_xy(Mg, 47); pdf.set_font("Helvetica", "B", 30); pdf.cell(CW, 14, t(m(ind.get("caja"))))
+    cv = ind.get("caja_var")
+    pdf.set_xy(Mg, 63); pdf.set_font("Helvetica", "", 11)
+    if cv is not None:
+        if cv < 0:
+            pdf.set_text_color(192, 57, 43);  txt = "Bajo " + m(abs(cv)) + " respecto al mes anterior"
+        else:
+            pdf.set_text_color(39, 174, 96);  txt = "Subio " + m(abs(cv)) + " respecto al mes anterior"
+        pdf.cell(CW, 6, t(txt))
+    else:
+        pdf.set_text_color(127, 140, 141); pdf.cell(CW, 6, t("Sin mes anterior para comparar"))
+ 
+    p = ind.get("pretax_pct")
+    if   p is None: c_rent, n_rent = (149,165,166), "Sin dato"
+    elif p >= 10:   c_rent, n_rent = (39,174,96),  "Sano"
+    elif p >= 5:    c_rent, n_rent = (241,196,15), "Minimo"
+    else:           c_rent, n_rent = (192,57,43),  "Peligro"
+    v_rent = (str(p) + "%") if p is not None else "s/d"
+    mb = ind.get("mb_pct"); v_mb = (str(mb) + "%") if mb is not None else "s/d"
+    cl = ind.get("cash_lag")
+    if   cl is None: c_cl, n_cl = (149,165,166), "Sin dato"
+    elif cl > 0:     c_cl, n_cl = (192,57,43),  "La utilidad no llego a caja"
+    else:            c_cl, n_cl = (39,174,96),  "La caja subio con la utilidad"
+ 
+    def card(x, y, w, h, titulo, valor, color, nota):
+        pdf.set_draw_color(220, 223, 227); pdf.set_fill_color(248, 249, 250)
+        pdf.rect(x, y, w, h, style="DF")
+        pdf.set_fill_color(*color); pdf.rect(x, y, w, 2.5, style="F")
+        pdf.set_xy(x + 3, y + 5);  pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 8.5)
+        pdf.multi_cell(w - 6, 4, t(titulo))
+        pdf.set_xy(x + 3, y + 13); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B", 16)
+        pdf.cell(w - 6, 8, t(valor))
+        pdf.set_xy(x + 3, y + 23); pdf.set_text_color(*color); pdf.set_font("Helvetica", "", 8)
+        pdf.multi_cell(w - 6, 4, t(nota))
+ 
+    y0, gap = 74, 4
+    cw = (CW - 2 * gap) / 3
+    card(Mg,                y0, cw, 32, "Rentabilidad del mes",     v_rent, c_rent,     n_rent)
+    card(Mg + cw + gap,     y0, cw, 32, "Margen de tu operacion",   v_mb,   (52,73,94), "Segun sector")
+    card(Mg + 2*(cw + gap), y0, cw, 32, "Brecha utilidad vs. caja", m(cl),  c_cl,       n_cl)
+ 
+    yN = y0 + 32 + 10
+    pdf.set_xy(Mg, yN); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(CW, 7, t("Lo que esto significa"))
+    pdf.set_draw_color(220, 223, 227); pdf.set_fill_color(252, 252, 253)
+    pdf.rect(Mg, yN + 9, CW, 62, style="DF")
+    pdf.set_xy(Mg + 3, yN + 12); pdf.set_font("Helvetica", "", 10.5); pdf.set_text_color(44, 62, 80)
+    texto = lectura.strip() if (lectura and lectura.strip()) else "(La lectura del mes la escribe el CFO antes de enviar el reporte al cliente.)"
+    pdf.multi_cell(CW - 6, 5.5, t(texto))
+ 
+    pdf.set_y(-18); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 8)
+    pdf.cell(0, 5, t("Vastion Accounting   |   Confidencial   |   Los numeros los pone el sistema; la lectura la escribe el CFO."), align="C")
+    return bytes(pdf.output())
  
  
 def tendencia(cli):
@@ -745,6 +820,8 @@ if not _periodos:
 else:
     mes_rep = st.selectbox("Mes a reportar", _periodos, key="rep_mes")
     if st.button("Generar reporte del cliente"):
+        st.session_state["rep_generado"] = mes_rep
+    if st.session_state.get("rep_generado") == mes_rep:
         ind = datos_reporte_cliente(cli_id, mes_rep)
         if ind is None:
             st.error("No se encontró ese mes.")
@@ -777,6 +854,23 @@ else:
                          placeholder="Ej.: El negocio es rentable, pero la utilidad se quedó en cobranza. Prioridad: cobrar, no vender.",
                          label_visibility="collapsed")
             st.caption("Los números los pone el sistema. La lectura la escribe el CFO.")
+            try:
+                import fpdf  # noqa: F401
+                _fpdf_ok = True
+            except Exception:
+                _fpdf_ok = False
+            if not _fpdf_ok:
+                st.error("Falta la librería **fpdf2**. En GitHub: agrega una línea `fpdf2` a requirements.txt, "
+                         "guarda, y en Streamlit Cloud entra a *Manage app* y haz *Reboot*. Sin esto no se genera el PDF.")
+            else:
+                try:
+                    _pdf = pdf_reporte_cliente(nombre_sel, mes_rep[:7], ind, st.session_state.get("rep_lectura", ""))
+                    st.download_button("📄 Descargar PDF para el cliente", data=_pdf,
+                                       file_name="Reporte_CFO_" + nombre_sel.replace(" ", "_") + "_" + mes_rep[:7] + ".pdf",
+                                       mime="application/pdf", key="rep_pdf_dl")
+                    st.caption("El PDF toma la lectura escrita arriba. Si la editas, haz clic fuera del cuadro antes de descargar.")
+                except Exception as _e:
+                    st.error("No se pudo generar el PDF: " + repr(_e))
  
  
 # ---------------------------------------------------------------------------
