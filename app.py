@@ -1,4 +1,5 @@
 
+
 # ============================================================================
 # TABLERO CFO VASTION · App de Roberto  v0.3
 # Carga + validación + REPORTE INTERNO de indicadores.
@@ -395,8 +396,11 @@ def estados_financieros(archivo_id):
     opcap_ini = sum(_sg(_yst(x),   x['nat']) for x in acc if _es_opcap(x))
     dopcap = opcap - opcap_ini
     generador = ytd['uai'] + ytd['dep'] - capex - dopcap
+    # Inventario inmóvil del ejercicio: cuentas de inventario (115-129) cuyo saldo no se movió desde la apertura.
+    # Genérico y transferible: detecta el congelado de cualquier cliente sin cablear cuentas por cliente.
+    inv_inmovil = sum(x['sf'] for x in acc if '115' <= x['g'] <= '129' and abs(x['sf'] - _yst(x)) < 1)
     cash = dict(uai=ytd['uai'], dep=ytd['dep'], capex=capex, opcap=opcap, opcap_ini=opcap_ini,
-                dopcap=dopcap, generador=generador, isr_prov=isr_prov, un=ytd['un'])
+                dopcap=dopcap, generador=generador, isr_prov=isr_prov, un=ytd['un'], inv_inmovil=inv_inmovil)
     return dict(er=er, bg=bg, efe=efe, ytd=ytd, cash=cash)
  
 def _fmt(v):
@@ -599,7 +603,10 @@ def ratios_mensuales(cli, periodo):
             ('5. Generador de Efectivo','= Generador de efectivo (YTD)', cash['generador'], 'pesos'),
             ('5. Generador de Efectivo','Generador de efectivo / Ingresos', sd(cash['generador'], ing), 'pct'),
             ('5. Generador de Efectivo','Capital operativo (posición)', cash['opcap'], 'pesos'),
+            ('5. Generador de Efectivo','(−) Inventario inmóvil del ejercicio', cash['inv_inmovil'], 'pesos'),
+            ('5. Generador de Efectivo','= Capital operativo vivo (sin inv. inmóvil)', cash['opcap'] - cash['inv_inmovil'], 'pesos'),
             ('5. Generador de Efectivo','Capital de trabajo (posición, referencia)', wc, 'pesos'),
+            ('5. Generador de Efectivo','= Capital de trabajo vivo (sin inv. inmóvil)', wc - cash['inv_inmovil'], 'pesos'),
         ]
     iM = pers.index(periodo)
     return snap(iM), snap(iM-1), (pers[iM-1] if iM > 0 else None)
