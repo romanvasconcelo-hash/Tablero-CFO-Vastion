@@ -198,11 +198,12 @@ def money(v):
     return "—" if v is None else f"${v:,.0f}"
  
  
-def pdf_reporte_cliente(nombre, periodo, ind, lectura):
+def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per_p=None, rat=None):
     """Reporte CFO mensual del cliente en PDF (una página). Caja al centro."""
     from fpdf import FPDF
     def t(s):
-        return str(s).encode('latin-1', 'replace').decode('latin-1')
+        return (str(s).replace("—", "-").replace("–", "-").replace("−", "-")
+                .replace("Δ", "Var.").encode('latin-1', 'replace').decode('latin-1'))
     def m(v):
         return money(v) if v is not None else "s/d"
     W, Mg = 210, 16
@@ -269,8 +270,92 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura):
     texto = lectura.strip() if (lectura and lectura.strip()) else "(La lectura del mes la escribe el CFO antes de enviar el reporte al cliente.)"
     pdf.multi_cell(CW - 6, 5.5, t(texto))
  
-    pdf.set_y(-18); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 8)
+    pdf.set_auto_page_break(False, 0)
+    pdf.set_y(-14); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 8)
     pdf.cell(0, 5, t("Vastion Accounting   |   Confidencial   |   Los numeros los pone el sistema; la lectura la escribe el CFO."), align="C")
+    pdf.set_auto_page_break(True, 16)
+ 
+    # ========================= ANEXO TÉCNICO =========================
+    def _fila(label, sa, sp, sv, dual, bold=False, header=False):
+        rh = 5.2
+        if pdf.get_y() + rh > 281:
+            pdf.add_page()
+        lab = label if len(str(label)) <= 50 else (str(label)[:48] + "..")
+        pdf.set_x(Mg)
+        if header:
+            pdf.set_fill_color(28, 45, 58); pdf.set_text_color(255, 255, 255); pdf.set_font("Helvetica", "B", 9)
+            pdf.cell(CW, 6, t(" " + lab), fill=True); pdf.ln(7); return
+        if sa is None and sp is None and sv is None:
+            pdf.set_fill_color(238, 240, 242); pdf.set_text_color(80, 90, 100); pdf.set_font("Helvetica", "B", 8)
+            pdf.cell(CW, rh, t(" " + lab), fill=True); pdf.ln(rh); return
+        pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B" if bold else "", 8.5)
+        if dual:
+            pdf.cell(86, rh, t(lab)); pdf.cell(32, rh, t(sa), align="R")
+            pdf.cell(30, rh, t(sp if sp is not None else ""), align="R"); pdf.cell(30, rh, t(sv if sv is not None else ""), align="R")
+        else:
+            pdf.cell(118, rh, t(lab)); pdf.cell(60, rh, t(sa), align="R")
+        pdf.ln(rh)
+ 
+    def _colhead(dual, ca, cpx):
+        pdf.set_x(Mg); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "B", 7.5)
+        if dual:
+            pdf.cell(86, 5, t("Concepto")); pdf.cell(32, 5, t(ca), align="R")
+            pdf.cell(30, 5, t(cpx if cpx else ""), align="R"); pdf.cell(30, 5, t("Variacion"), align="R")
+        else:
+            pdf.cell(118, 5, t("Concepto")); pdf.cell(60, 5, t(ca), align="R")
+        pdf.ln(5)
+ 
+    def _estado(titulo, rows, dual, ca, cpx):
+        if pdf.get_y() + 24 > 281: pdf.add_page()
+        _fila(titulo, None, None, None, dual, header=True)
+        _colhead(dual, ca, cpx)
+        for label, va, vp, bold in rows:
+            if va is None and vp is None:
+                _fila(label, None, None, None, dual)
+            else:
+                sa = _fmt(va)
+                sp = _fmt(vp) if dual else None
+                sv = _fmt((va or 0) - (vp or 0)) if dual else None
+                _fila(label, sa, sp, sv, dual, bold=bold)
+        pdf.ln(3)
+ 
+    def _banner_anexo(titulo, nota):
+        pdf.add_page()
+        pdf.set_fill_color(28, 45, 58); pdf.rect(0, 0, W, 16, style="F")
+        pdf.set_xy(Mg, 4); pdf.set_text_color(255, 255, 255); pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(CW, 8, t(titulo))
+        pdf.set_xy(Mg, 20); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 7.5)
+        pdf.multi_cell(CW, 4, t(nota)); pdf.ln(2)
+ 
+    cp_lbl = (per_p[:7] if per_p else None)
+    if ef_a is not None:
+        _banner_anexo("Anexo - Estados financieros  ·  " + periodo,
+                      "ER y EFE en acumulado del ejercicio (YTD); Balance en posicion del mes. "
+                      "Para clientes en recontabilizacion son diagnostico interno hasta cerrar Fase 0.")
+        dual = ef_p is not None
+        _estado("Estado de Resultados", er_rows_cmp(ef_a, ef_p), dual, periodo, cp_lbl)
+        _estado("Balance General", bg_rows_cmp(ef_a, ef_p), dual, periodo, cp_lbl)
+        _estado("Estado de Flujo de Efectivo", efe_rows_cmp(ef_a, ef_p), dual, periodo, cp_lbl)
+ 
+    if rat is not None and rat[0]:
+        a_rows, p_rows, rper = rat
+        _banner_anexo("Anexo - Razones financieras  ·  " + periodo,
+                      "Acumulado del anio a la fecha (YTD), sin anualizar. Los dias reflejan los dias transcurridos del anio.")
+        pdual = bool(p_rows)
+        pmap = {(s, l): (v, f) for s, l, v, f in p_rows} if p_rows else {}
+        cpr = (rper[:7] if rper else None)
+        sec_now = None
+        for s, l, v, f in a_rows:
+            if s != sec_now:
+                if pdf.get_y() + 14 > 281: pdf.add_page()
+                _fila(s, None, None, None, pdual, header=True)
+                _colhead(pdual, periodo, cpr)
+                sec_now = s
+            vp = pmap.get((s, l), (None, f))[0]
+            sa = _fr(v, f); sp = _fr(vp, f) if pdual else None
+            sv = _fvar(v, vp, f) if pdual else None
+            _fila(l, sa, sp, sv, pdual)
+ 
     return bytes(pdf.output())
  
  
@@ -864,7 +949,11 @@ else:
                          "guarda, y en Streamlit Cloud entra a *Manage app* y haz *Reboot*. Sin esto no se genera el PDF.")
             else:
                 try:
-                    _pdf = pdf_reporte_cliente(nombre_sel, mes_rep[:7], ind, st.session_state.get("rep_lectura", ""))
+                    _res_ef = comparativo_estados(cli_id, mes_rep)
+                    _ef_a, _ef_p, _per_p = _res_ef if _res_ef else (None, None, None)
+                    _rat = ratios_mensuales(cli_id, mes_rep)
+                    _pdf = pdf_reporte_cliente(nombre_sel, mes_rep[:7], ind, st.session_state.get("rep_lectura", ""),
+                                               ef_a=_ef_a, ef_p=_ef_p, per_p=_per_p, rat=_rat)
                     st.download_button("📄 Descargar PDF para el cliente", data=_pdf,
                                        file_name="Reporte_CFO_" + nombre_sel.replace(" ", "_") + "_" + mes_rep[:7] + ".pdf",
                                        mime="application/pdf", key="rep_pdf_dl")
