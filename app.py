@@ -611,25 +611,52 @@ def pdf_interno_2025(nombre, anio, serie, ef_cierre=None, dias_cierre=365, creci
     return bytes(pdf.output())
 
 
-def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per_p=None, rat=None):
-    """Reporte CFO mensual del cliente en PDF (una página). Caja al centro."""
+def _metas_cliente_rows(ind, metas):
+    """Filas de metas en lenguaje de dueno: (indicador, hoy, meta, estado, ok)."""
+    metas = metas or {}; rows = []
+    p = ind.get("pretax_pct")
+    if p is not None:
+        m = meta_de("pretax_pct", metas); _, edo = evaluar_meta(p, m)
+        mv = m["valor_meta"] if m else 10.0
+        rows.append(("Rentabilidad (antes de impuestos)", "{:.1f}%".format(p), "{:.0f}%".format(mv),
+                     ("Cumple" if edo == "cumple" else "Falta"), edo == "cumple"))
+    ef = ind.get("_ef")
+    if ef is not None:
+        s = _stocks_de(ef)
+        if s.get("pas_circ"):
+            acpc = s["act_circ"] / s["pas_circ"]; ok = acpc >= LICIT_AC_PC
+            rows.append(("Liquidez (activo / pasivo circulante)", "{:.2f}x".format(acpc),
+                         "{:.2f}x".format(LICIT_AC_PC), ("Cumple" if ok else "Falta"), ok))
+        if s.get("activo"):
+            ptat = s["pasivo"] / s["activo"]; ok = ptat <= LICIT_PT_AT
+            rows.append(("Endeudamiento (pasivo / activo)", "{:.1f}%".format(ptat*100),
+                         "<={:.0f}%".format(LICIT_PT_AT*100), ("Cumple" if ok else "Falta"), ok))
+    return rows
+
+def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per_p=None, rat=None,
+                        numero_mes=None, acciones=None, valor_generado=None, metas=None):
+    """Reporte CFO mensual del cliente. Base YTD (acumulado). Caja al centro (regla de hierro)."""
     from fpdf import FPDF
+    class _PDFCli(FPDF):
+        def footer(self):
+            self.set_y(-12); self.set_font("Helvetica", "", 7.5); self.set_text_color(150, 150, 150)
+            self.set_x(self.l_margin)
+            self.cell(0, 5, "Vastion Accounting  |  Confidencial  |  Pagina " + str(self.page_no()), align="C")
     def t(s):
-        return (str(s).replace("—", "-").replace("–", "-").replace("−", "-")
-                .replace("Δ", "Var.").encode('latin-1', 'replace').decode('latin-1'))
+        return (str(s).replace("\u2014", "-").replace("\u2013", "-").replace("\u2212", "-")
+                .replace("\u0394", "Var.").encode("latin-1", "replace").decode("latin-1"))
     def m(v):
         return money(v) if v is not None else "s/d"
-    W, Mg = 210, 16
-    CW = W - 2 * Mg
-    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    W, Mg = 210, 16; CW = W - 2 * Mg
+    pdf = _PDFCli(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=16)
-    pdf.add_page()
 
-    pdf.set_fill_color(28, 45, 58)
-    pdf.rect(0, 0, W, 30, style="F")
+    # ===================== HOJA 1: el mes en una hoja =====================
+    pdf.add_page()
+    pdf.set_fill_color(28, 45, 58); pdf.rect(0, 0, W, 30, style="F")
     pdf.set_text_color(255, 255, 255)
     pdf.set_xy(Mg, 8);  pdf.set_font("Helvetica", "B", 18); pdf.cell(CW, 8, t("Reporte CFO Mensual"))
-    pdf.set_xy(Mg, 18); pdf.set_font("Helvetica", "", 11);  pdf.cell(CW, 6, t(nombre + "   |   " + periodo))
+    pdf.set_xy(Mg, 18); pdf.set_font("Helvetica", "", 11); pdf.cell(CW, 6, t(nombre + "   |   " + periodo))
 
     pdf.set_text_color(44, 62, 80)
     pdf.set_xy(Mg, 40); pdf.set_font("Helvetica", "", 11); pdf.cell(CW, 6, t("Tu caja al cierre del mes"))
@@ -637,56 +664,102 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
     cv = ind.get("caja_var")
     pdf.set_xy(Mg, 63); pdf.set_font("Helvetica", "", 11)
     if cv is not None:
-        if cv < 0:
-            pdf.set_text_color(192, 57, 43);  txt = "Bajo " + m(abs(cv)) + " respecto al mes anterior"
-        else:
-            pdf.set_text_color(39, 174, 96);  txt = "Subio " + m(abs(cv)) + " respecto al mes anterior"
-        pdf.cell(CW, 6, t(txt))
+        if cv < 0: pdf.set_text_color(192, 57, 43); _tx = "Bajo " + m(abs(cv)) + " respecto al mes anterior"
+        else:      pdf.set_text_color(39, 174, 96); _tx = "Subio " + m(abs(cv)) + " respecto al mes anterior"
+        pdf.cell(CW, 6, t(_tx))
     else:
         pdf.set_text_color(127, 140, 141); pdf.cell(CW, 6, t("Sin mes anterior para comparar"))
 
+    yNum = 72
+    if numero_mes and numero_mes.strip():
+        pdf.set_draw_color(220, 223, 227); pdf.set_fill_color(248, 249, 250); pdf.rect(Mg, yNum, CW, 15, style="DF")
+        pdf.set_fill_color(28, 45, 58); pdf.rect(Mg, yNum, 2.5, 15, style="F")
+        pdf.set_xy(Mg + 5, yNum + 2.5); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 8.5)
+        pdf.cell(CW - 8, 4, t("El numero mas importante del mes"))
+        pdf.set_xy(Mg + 5, yNum + 7.5); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B", 11)
+        pdf.multi_cell(CW - 8, 5, t(numero_mes.strip()))
+        y0 = yNum + 21
+    else:
+        y0 = yNum
+
     p = ind.get("pretax_pct")
-    if   p is None: c_rent, n_rent = (149,165,166), "Sin dato"
-    elif p >= 10:   c_rent, n_rent = (39,174,96),  "Sano"
-    elif p >= 5:    c_rent, n_rent = (241,196,15), "Minimo"
-    else:           c_rent, n_rent = (192,57,43),  "Peligro"
+    if   p is None: c_rent, n_rent = (149, 165, 166), "Sin dato"
+    elif p >= 10:   c_rent, n_rent = (39, 174, 96),  "Sano"
+    elif p >= 5:    c_rent, n_rent = (241, 196, 15), "Minimo"
+    else:           c_rent, n_rent = (192, 57, 43),  "Peligro"
     v_rent = (str(p) + "%") if p is not None else "s/d"
     mb = ind.get("mb_pct"); v_mb = (str(mb) + "%") if mb is not None else "s/d"
-    cl = ind.get("cash_lag")
-    if   cl is None: c_cl, n_cl = (149,165,166), "Sin dato"
-    elif cl > 0:     c_cl, n_cl = (192,57,43),  "La utilidad no llego a caja"
-    else:            c_cl, n_cl = (39,174,96),  "La caja subio con la utilidad"
+    uai = ind.get("uai"); cl = ind.get("cash_lag")
+    if   cl is None or uai is None: c_cl, n_cl = (149, 165, 166), "Sin dato"
+    elif uai <= 0:                  c_cl, n_cl = (149, 165, 166), "Hay perdida; la prioridad es la rentabilidad"
+    elif cl > 0:                    c_cl, n_cl = (192, 57, 43),  "La utilidad no llego a caja"
+    else:                           c_cl, n_cl = (39, 174, 96),  "La caja siguio a la utilidad"
 
     def card(x, y, w, h, titulo, valor, color, nota):
-        pdf.set_draw_color(220, 223, 227); pdf.set_fill_color(248, 249, 250)
-        pdf.rect(x, y, w, h, style="DF")
+        pdf.set_draw_color(220, 223, 227); pdf.set_fill_color(248, 249, 250); pdf.rect(x, y, w, h, style="DF")
         pdf.set_fill_color(*color); pdf.rect(x, y, w, 2.5, style="F")
-        pdf.set_xy(x + 3, y + 5);  pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 8.5)
-        pdf.multi_cell(w - 6, 4, t(titulo))
-        pdf.set_xy(x + 3, y + 13); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B", 16)
-        pdf.cell(w - 6, 8, t(valor))
-        pdf.set_xy(x + 3, y + 23); pdf.set_text_color(*color); pdf.set_font("Helvetica", "", 8)
-        pdf.multi_cell(w - 6, 4, t(nota))
+        pdf.set_xy(x + 3, y + 5);  pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 8.5); pdf.multi_cell(w - 6, 4, t(titulo))
+        pdf.set_xy(x + 3, y + 13); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B", 16); pdf.cell(w - 6, 8, t(valor))
+        pdf.set_xy(x + 3, y + 23); pdf.set_text_color(*color); pdf.set_font("Helvetica", "", 8); pdf.multi_cell(w - 6, 4, t(nota))
 
-    y0, gap = 74, 4
-    cw = (CW - 2 * gap) / 3
-    card(Mg,                y0, cw, 32, "Rentabilidad del mes",     v_rent, c_rent,     n_rent)
-    card(Mg + cw + gap,     y0, cw, 32, "Margen de tu operacion",   v_mb,   (52,73,94), "Segun sector")
-    card(Mg + 2*(cw + gap), y0, cw, 32, "Brecha utilidad vs. caja", m(cl),  c_cl,       n_cl)
+    gap = 4; cw = (CW - 2 * gap) / 3
+    card(Mg,                y0, cw, 32, "Rentabilidad del ano (acumulada)", v_rent, c_rent,     n_rent)
+    card(Mg + cw + gap,     y0, cw, 32, "Margen de tu operacion",           v_mb,   (52, 73, 94), "Acumulado del ano")
+    card(Mg + 2*(cw + gap), y0, cw, 32, "Brecha utilidad vs. caja",         m(cl),  c_cl,        n_cl)
 
-    yN = y0 + 32 + 10
-    pdf.set_xy(Mg, yN); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(CW, 7, t("Lo que esto significa"))
-    pdf.set_draw_color(220, 223, 227); pdf.set_fill_color(252, 252, 253)
-    pdf.rect(Mg, yN + 9, CW, 62, style="DF")
+    yN = y0 + 32 + 8
+    pdf.set_xy(Mg, yN); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B", 12); pdf.cell(CW, 7, t("Lo que esto significa"))
+    hbox = 278 - (yN + 9)
+    if hbox < 30: hbox = 30
+    pdf.set_draw_color(220, 223, 227); pdf.set_fill_color(252, 252, 253); pdf.rect(Mg, yN + 9, CW, hbox, style="DF")
     pdf.set_xy(Mg + 3, yN + 12); pdf.set_font("Helvetica", "", 10.5); pdf.set_text_color(44, 62, 80)
-    texto = lectura.strip() if (lectura and lectura.strip()) else "(La lectura del mes la escribe el CFO antes de enviar el reporte al cliente.)"
-    pdf.multi_cell(CW - 6, 5.5, t(texto))
+    _txt = lectura.strip() if (lectura and lectura.strip()) else "(La lectura del mes la escribe el CFO antes de enviar el reporte al cliente.)"
+    pdf.multi_cell(CW - 6, 5.5, t(_txt))
 
-    pdf.set_auto_page_break(False, 0)
-    pdf.set_y(-14); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 8)
-    pdf.cell(0, 5, t("Vastion Accounting   |   Confidencial   |   Los numeros los pone el sistema; la lectura la escribe el CFO."), align="C")
-    pdf.set_auto_page_break(True, 16)
+    # ===================== HOJA 2: que hacer =====================
+    pdf.add_page()
+    pdf.set_fill_color(28, 45, 58); pdf.rect(0, 0, W, 22, style="F")
+    pdf.set_text_color(255, 255, 255); pdf.set_xy(Mg, 6); pdf.set_font("Helvetica", "B", 15); pdf.cell(CW, 8, t("Que hacer este mes"))
+    pdf.set_y(30)
+    pdf.set_x(Mg); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B", 12); pdf.cell(CW, 7, t("Las 3 acciones del mes")); pdf.ln(9)
+    _acc = [a.strip() for a in (acciones or "").split("\n") if a.strip()][:3]
+    if not _acc:
+        pdf.set_x(Mg); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 10)
+        pdf.multi_cell(CW, 5.5, t("(El CFO escribe aqui las 3 acciones concretas del mes, una por linea.)")); pdf.ln(2)
+    else:
+        for i, a in enumerate(_acc, 1):
+            yb = pdf.get_y()
+            pdf.set_fill_color(28, 45, 58); pdf.set_text_color(255, 255, 255); pdf.set_font("Helvetica", "B", 11)
+            pdf.set_xy(Mg, yb); pdf.cell(8, 8, t(str(i)), align="C", fill=True)
+            pdf.set_xy(Mg + 12, yb); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "", 10.5)
+            pdf.multi_cell(CW - 12, 5.5, t(a)); pdf.ln(3)
+    pdf.ln(2); pdf.set_x(Mg); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B", 12); pdf.cell(CW, 7, t("Tus metas")); pdf.ln(9)
+    pdf.set_x(Mg); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "B", 8)
+    pdf.cell(82, 6, t("Indicador")); pdf.cell(32, 6, t("Hoy"), align="R"); pdf.cell(32, 6, t("Meta"), align="R"); pdf.cell(CW - 146, 6, t("Estado"), align="R"); pdf.ln(6)
+    _fm = _metas_cliente_rows(ind, metas)
+    if not _fm:
+        pdf.set_x(Mg); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 9); pdf.cell(CW, 6, t("Sin metas disponibles para este periodo.")); pdf.ln(6)
+    for lbl, hoy, meta_v, edo, ok in _fm:
+        pdf.set_x(Mg); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "", 9)
+        pdf.cell(82, 6, t(lbl)); pdf.cell(32, 6, t(hoy), align="R"); pdf.cell(32, 6, t(meta_v), align="R")
+        if ok is None: pdf.set_text_color(127, 140, 141)
+        elif ok:       pdf.set_text_color(39, 174, 96)
+        else:          pdf.set_text_color(192, 57, 43)
+        pdf.cell(CW - 146, 6, t(edo), align="R"); pdf.ln(6)
+
+    # ===================== HOJA 3: valor generado =====================
+    pdf.add_page()
+    pdf.set_fill_color(28, 45, 58); pdf.rect(0, 0, W, 22, style="F")
+    pdf.set_text_color(255, 255, 255); pdf.set_xy(Mg, 6); pdf.set_font("Helvetica", "B", 15); pdf.cell(CW, 8, t("Valor generado"))
+    pdf.set_y(34)
+    if valor_generado and valor_generado.strip():
+        pdf.set_x(Mg); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "", 11)
+        pdf.multi_cell(CW, 6, t(valor_generado.strip()))
+    else:
+        pdf.set_x(Mg); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 10.5)
+        pdf.multi_cell(CW, 5.5, t("(El CFO documenta aqui el valor generado por Vastion en el mes, en pesos: impuestos "
+                                  "ahorrados, IVA recuperado, contingencias evitadas, ahorro financiero. Incluir el "
+                                  "acumulado: 'Desde que Vastion es tu CFO hemos generado $X en valor documentado.')"))
 
     # ========================= ANEXO TÉCNICO =========================
     def _fila(label, sa, sp, sv, dual, bold=False, header=False):
@@ -802,6 +875,7 @@ def tendencia(cli):
 
 
 def datos_reporte_cliente(cli, periodo):
+    """Datos del reporte del cliente, base YTD (acumulado). Caja = agrupadores 101/102/103 (igual que el flujo)."""
     conn = get_conn(); cur = conn.cursor()
     try:
         cur.execute("SELECT archivo_vigente FROM periodo_estado WHERE cliente_id=%s AND periodo=%s", (cli, periodo))
@@ -811,18 +885,20 @@ def datos_reporte_cliente(cli, periodo):
         cur.execute("""SELECT archivo_vigente FROM periodo_estado
                        WHERE cliente_id=%s AND periodo<%s AND archivo_vigente IS NOT NULL
                        ORDER BY periodo DESC LIMIT 1""", (cli, periodo))
-        rp = cur.fetchone()
-        caja_prev = None
-        if rp:
-            cur.execute("""SELECT COALESCE(SUM(b.saldo_final),0) FROM insumos_balanza i
-                           JOIN raw_balanza b ON b.archivo_id=i.archivo_id AND b.num_cuenta=i.num_cuenta
-                           WHERE i.archivo_id=%s AND i.es_hoja AND (i.cod_agrupador LIKE '101%%' OR i.cod_agrupador LIKE '102%%')""", (rp[0],))
-            caja_prev = float(cur.fetchone()[0])
+        rp = cur.fetchone(); bal_prev = rp[0] if rp else None
     finally:
         cur.close(); conn.close()
-    ind = cargar_indicadores(bal, cli, periodo)
-    ind['caja_prev'] = caja_prev
-    ind['caja_var'] = (ind['caja'] - caja_prev) if (ind['caja'] is not None and caja_prev is not None) else None
+    ef = estados_financieros(bal); ytd = ef["ytd"]; ing = ytd["ing"]
+    ind = {}
+    ind["pretax_pct"] = round(ytd["uai"] / ing * 100, 1) if ing else None
+    ind["mb_pct"]     = round(ytd["ub"] / ing * 100, 1) if ing else None
+    ind["uai"]        = ytd["uai"]
+    ind["caja"]       = ef["efe"]["efec_fin"]
+    ind["cash_lag"]   = ytd["uai"] - (ef["efe"]["efec_fin"] - ef["efe"]["efec_ini"])
+    caja_prev = estados_financieros(bal_prev)["efe"]["efec_fin"] if bal_prev else None
+    ind["caja_prev"]  = caja_prev
+    ind["caja_var"]   = (ind["caja"] - caja_prev) if caja_prev is not None else None
+    ind["_ef"]        = ef
     return ind
 
 def periodos_cargados(cli):
@@ -1522,22 +1598,33 @@ else:
             # tres indicadores en lenguaje de dueño
             c1, c2, c3 = st.columns(3)
             with c1:
-                st.metric("Rentabilidad del mes", f"{ind['pretax_pct']}%" if ind["pretax_pct"] is not None else "—")
+                st.metric("Rentabilidad del año (acumulada)", f"{ind['pretax_pct']}%" if ind["pretax_pct"] is not None else "—")
                 st.caption(sem_pretax(ind["pretax_pct"]))
             with c2:
                 st.metric("Margen de tu operación", f"{ind['mb_pct']}%" if ind["mb_pct"] is not None else "—")
             with c3:
                 st.metric("Brecha utilidad vs. caja", money(ind["cash_lag"]))
-                if ind["cash_lag"] is not None and ind["cash_lag"] > 0:
+                _uai = ind.get("uai"); _cl = ind.get("cash_lag")
+                if _cl is None or _uai is None:
+                    st.caption("Sin dato")
+                elif _uai <= 0:
+                    st.caption("⚪ Hay pérdida; la prioridad es la rentabilidad")
+                elif _cl > 0:
                     st.caption("🔴 La utilidad no llegó a caja")
-                elif ind["cash_lag"] is not None:
-                    st.caption("🟢 La caja subió con la utilidad")
+                else:
+                    st.caption("🟢 La caja siguió a la utilidad")
             # lectura del mes (la escribe Roberto)
             st.markdown("**Lo que esto significa** (escríbelo para el dueño)")
             st.text_area("Lectura del mes", key="rep_lectura",
                          placeholder="Ej.: El negocio es rentable, pero la utilidad se quedó en cobranza. Prioridad: cobrar, no vender.",
                          label_visibility="collapsed")
             st.caption("Los números los pone el sistema. La lectura la escribe el CFO.")
+            st.text_input("El número más importante del mes (opcional)", key="rep_numero",
+                          placeholder="Ej.: Tu caja subió $1.7M, pero $9M siguen en cobranza.")
+            st.text_area("Las 3 acciones del mes (una por línea)", key="rep_acciones",
+                         placeholder="Cobrar la cartera vencida de obra\nFrenar compra de material sin contrato firmado\nReclasificar el crédito de corto a largo plazo")
+            st.text_area("Valor generado este mes (en pesos)", key="rep_valor",
+                         placeholder="Ej.: Recuperamos $420,000 de IVA a favor. Acumulado del año: $1.3M.")
             try:
                 import fpdf  # noqa: F401
                 _fpdf_ok = True
@@ -1551,8 +1638,13 @@ else:
                     _res_ef = comparativo_estados(cli_id, mes_rep)
                     _ef_a, _ef_p, _per_p = _res_ef if _res_ef else (None, None, None)
                     _rat = ratios_mensuales(cli_id, mes_rep)
+                    _metas_c = get_metas(cli_id, int(mes_rep[:4]))
                     _pdf = pdf_reporte_cliente(nombre_sel, mes_rep[:7], ind, st.session_state.get("rep_lectura", ""),
-                                               ef_a=_ef_a, ef_p=_ef_p, per_p=_per_p, rat=_rat)
+                                               ef_a=_ef_a, ef_p=_ef_p, per_p=_per_p, rat=_rat,
+                                               numero_mes=st.session_state.get("rep_numero", ""),
+                                               acciones=st.session_state.get("rep_acciones", ""),
+                                               valor_generado=st.session_state.get("rep_valor", ""),
+                                               metas=_metas_c)
                     st.download_button("📄 Descargar PDF para el cliente", data=_pdf,
                                        file_name="Reporte_CFO_" + nombre_sel.replace(" ", "_") + "_" + mes_rep[:7] + ".pdf",
                                        mime="application/pdf", key="rep_pdf_dl")
