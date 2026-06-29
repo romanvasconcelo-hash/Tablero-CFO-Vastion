@@ -486,7 +486,7 @@ def _pdf_tabla_ratios(pdf, t, Mg, CW, a_rows, p_rows, ca, cp):
     pdf.ln(3)
 
 def pdf_interno_2025(nombre, anio, serie, ef_cierre=None, dias_cierre=365, crecimiento=None,
-                     ef_cierre_prev=None, rat_now=None, rat_prev=None, datos_cliente=None):
+                     ef_cierre_prev=None, rat_now=None, rat_prev=None, datos_cliente=None, fiscal_sem=None):
     """Reporte interno: modelo de negocio (cierre) + tendencia y resumen del ejercicio."""
     from fpdf import FPDF
     import io as _io
@@ -645,6 +645,32 @@ def pdf_interno_2025(nombre, anio, serie, ef_cierre=None, dias_cierre=365, creci
         pdf.cell(CW,5,t("Acumulado del ejercicio a la fecha de cierre, sin anualizar."))
         pdf.set_y(27)
         _pdf_tabla_ratios(pdf, t, Mg, CW, rat_now, rat_prev, str(anio), (str(anio-1) if rat_prev else None))
+    # ===== Semáforos fiscales (cierre del ejercicio) =====
+    if fiscal_sem:
+        _cmap = {"rojo": (192,57,43), "amarillo": (241,196,15), "verde": (39,174,96),
+                 "neutral": (149,165,166), "gris": (149,165,166)}
+        pdf.add_page()
+        pdf.set_fill_color(28,45,58); pdf.rect(0,0,W,22,style="F")
+        pdf.set_text_color(255,255,255); pdf.set_xy(Mg,5); pdf.set_font("Helvetica","B",14)
+        pdf.cell(CW,7,t("Semaforos fiscales - cierre " + str(anio)))
+        pdf.set_xy(Mg,13); pdf.set_font("Helvetica","",9)
+        pdf.cell(CW,5,t("Diagnostico fiscal interno. C2 desde contabilidad; C3/C4 con captura. C1 (69-B) en stand-by."))
+        pdf.set_y(30)
+        for luz, titulo, valor, msg, accion in fiscal_sem:
+            col = _cmap.get(luz, (149,165,166))
+            yb = pdf.get_y()
+            pdf.set_draw_color(220,223,227); pdf.set_fill_color(248,249,250); pdf.rect(Mg, yb, CW, 22, style="DF")
+            pdf.set_fill_color(*col); pdf.rect(Mg, yb, 3, 22, style="F")
+            pdf.set_xy(Mg+7, yb+3); pdf.set_text_color(44,62,80); pdf.set_font("Helvetica","B",11)
+            pdf.cell(CW-60, 6, t(titulo))
+            pdf.set_xy(Mg+7+CW-60, yb+3); pdf.set_text_color(*col); pdf.set_font("Helvetica","B",13)
+            pdf.cell(45, 6, t(valor), align="R")
+            pdf.set_xy(Mg+7, yb+10); pdf.set_text_color(80,80,80); pdf.set_font("Helvetica","",9)
+            pdf.multi_cell(CW-12, 4.2, t(msg))
+            if accion:
+                pdf.set_xy(Mg+7, yb+16.5); pdf.set_text_color(*col); pdf.set_font("Helvetica","I",8.5)
+                pdf.multi_cell(CW-12, 4, t("Accion facturable: " + accion))
+            pdf.set_y(yb+25)
     return bytes(pdf.output())
 
 
@@ -1709,56 +1735,7 @@ if st.button("Cargar y validar", type="primary", disabled=not (subidos and 'BALA
     else:
         st.success(f"## 🟢 VALIDADO · {per}\nEl periodo entra al tablero.")
 
-    # ---- 3 indicadores clave, uno por eje ----
-    st.subheader("Indicadores clave")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.caption("EJE 1 · GENERACIÓN")
-        st.metric("Pre-Tax Profit %", f"{ind['pretax_pct']}%" if ind['pretax_pct'] is not None else "—")
-        st.caption(sem_pretax(ind['pretax_pct']))
-    with c2:
-        st.caption("EJE 2 · TRASLADO")
-        st.metric("Cash Lag", money(ind['cash_lag']))
-        if ind['cash_lag'] is None:
-            st.caption("Necesita mes previo")
-        elif ind['cash_lag'] > 0:
-            st.caption("🔴 Caja cayó más que la utilidad")
-        else:
-            st.caption("🟢 Caja por encima de la utilidad")
-    with c3:
-        st.caption("EJE 3 · FISCAL")
-        st.metric("EIVA %", f"{ind['eiva_pct']}%" if ind['eiva_pct'] is not None else "—")
-        if ind['iva_neto'] is not None:
-            st.caption(("IVA a cargo " + money(ind['iva_neto'])) if ind['iva_neto'] > 0
-                       else ("IVA a favor " + money(abs(ind['iva_neto']))))
-
-    # ---- indicadores de apoyo ----
-    st.subheader("Apoyo")
-    a1, a2, a3, a4 = st.columns(4)
-    a1.metric("Margen Bruto %", f"{ind['mb_pct']}%" if ind['mb_pct'] is not None else "—")
-    a2.metric("Nómina / Ingresos", f"{ind['nomina_pct']}%" if ind['nomina_pct'] is not None else "—")
-    a3.metric("GPLD", f"{ind['gpld']}x" if ind['gpld'] is not None else "n/a")
-    a4.metric("Caja fin de mes", money(ind['caja']))
-
-    # ---- Avance contra meta (Actual · Meta · Brecha · Estado) ----
-    st.subheader("Avance contra meta")
-    _metas_b = get_metas(cli_id, int(per[:4]))
-    _items_b = [("Pre-Tax Profit %", "pretax_pct", ind["pretax_pct"], "pctnum"),
-                ("GPLD",             "gpld",       ind["gpld"],       "x"),
-                ("Cash Lag",         "cash_lag",   ind["cash_lag"],   "pesos")]
-    _tab_b = tabla_avance_meta(_items_b, _metas_b)
-    if _tab_b:
-        st.markdown(_tab_b)
-        st.caption("Brecha firmada: negativa = falta para llegar a la meta (R-MET-02). "
-                   "Anclas duras Pre-Tax 10% y GPLD 1.35 (Crabtree); se sobrescriben por cliente desde meta_indicador.")
-    else:
-        st.caption("Sin metas definidas para este cliente/ejercicio.")
-
-    # ---- P&L de Gestión ----
-    with st.expander("P&L de Gestión (no constituye estado de resultados NIF)"):
-        st.dataframe(
-            [{"Concepto": c, "Monto": f"{m:,.0f}", "%": (f"{p}%" if p is not None else "")} for c,m,p in ind['pl']],
-            use_container_width=True, hide_index=True)
+    st.caption("Indicadores clave, apoyo y avance contra meta: ve la sección **Indicadores clave** abajo (elige el mes).")
 
     # ---- detalle de compuertas ----
     with st.expander("Detalle de validación"):
@@ -1788,10 +1765,16 @@ with st.expander("Metas del ejercicio (onboarding) — propuesta de licitación"
     st.caption("Un solo dato fija la meta de licitación del ejercicio: el CNT meta = 20% de la propuesta (sin IVA).")
     _nv = st.number_input("Propuesta objetivo del ejercicio (sin IVA, MXN)",
                           min_value=0.0, value=float(_prv), step=1_000_000.0, format="%.0f", key="meta_prop")
+    _isn_row = _metas_cur.get("isn_tasa")
+    _isn_v = _isn_row["valor_meta"] if _isn_row else 4.0
+    _isn = st.number_input("Tasa de ISN del estado (%) — NL 2026 = 4.0; se parametriza por estado (R-FIS-07)",
+                           min_value=0.0, max_value=10.0, value=float(_isn_v), step=0.5, format="%.2f", key="meta_isn")
     if st.button("Guardar meta del ejercicio", key="meta_save"):
         set_meta(cli_id, int(_ejm), "licit_propuesta", _nv, tipo="umbral", direccion="mayor_mejor",
                  fuente="licitacion", nota="Propuesta objetivo sin IVA; CNT meta = 20% de este valor.")
-        st.success("Meta guardada para el ejercicio " + str(int(_ejm)) + ".")
+        set_meta(cli_id, int(_ejm), "isn_tasa", _isn, tipo="parametro", direccion="contextual",
+                 fuente="ley_hacienda_estatal", nota="Tasa ISN del estado del cliente; se siembra en onboarding.")
+        st.success("Meta y tasa ISN guardadas para el ejercicio " + str(int(_ejm)) + ".")
 
 with st.expander("Captura fiscal del mes (Controles 3 y 4)", expanded=False):
     _pcf = periodos_cargados(cli_id)
@@ -1822,163 +1805,66 @@ with st.expander("Captura fiscal del mes (Controles 3 y 4)", expanded=False):
 
 
 # ---------------------------------------------------------------------------
-# COMPARATIVO DE MESES CARGADOS
+# INDICADORES CLAVE (revision por mes)
 # ---------------------------------------------------------------------------
 st.divider()
-st.subheader("Tendencia de los meses cargados")
-if st.button("Ver tendencia"):
-    datos = tendencia(cli_id)
-    if not datos:
-        st.info("Este cliente no tiene meses cargados todavía.")
-    else:
-        filas = [{"Mes": d["periodo"],
-                  "Caja": money(d["caja"]),
-                  "Pre-Tax %": (f"{d['pretax']}%" if d["pretax"] is not None else "—"),
-                  "Cash Lag": money(d["cash_lag"]),
-                  "Comparable": ("⚠️ con observaciones" if d["flag"] else "✓ limpio")} for d in datos]
-        st.dataframe(filas, use_container_width=True, hide_index=True)
-        import pandas as pd
-        caja_df = pd.DataFrame([{"Mes": d["periodo"], "Caja": d["caja"]} for d in datos if d["caja"] is not None]).set_index("Mes")
-        if not caja_df.empty:
-            st.caption("Caja al cierre por mes")
-            st.line_chart(caja_df)
-        if any(d["flag"] for d in datos):
-            st.caption("⚠️ Los meses marcados traen observaciones de contabilidad (en recontabilización). La tendencia puede no reflejar la operación real hasta que se ajusten.")
-
-
-# ---------------------------------------------------------------------------
-# REPORTE DEL CLIENTE (vista dueño)
-# ---------------------------------------------------------------------------
-st.divider()
-st.subheader("Reporte del cliente")
-_periodos = periodos_cargados(cli_id)
-if not _periodos:
-    st.caption("Carga al menos un mes para generar el reporte del cliente.")
+st.subheader("Indicadores clave")
+st.caption("Revisión por mes. Caja al centro (regla de hierro). Tres ejes: generación, traslado, fiscal.")
+_pind = periodos_cargados(cli_id)
+if not _pind:
+    st.caption("Carga al menos un mes.")
 else:
-    mes_rep = st.selectbox("Mes a reportar", _periodos, key="rep_mes")
-    if st.button("Generar reporte del cliente"):
-        st.session_state["rep_generado"] = mes_rep
-    if st.session_state.get("rep_generado") == mes_rep:
-        ind = datos_reporte_cliente(cli_id, mes_rep)
-        if ind is None:
-            st.error("No se encontró ese mes.")
+    mes_ind = st.selectbox("Mes", _pind, key="ind_mes")
+    if st.button("Ver indicadores", key="ind_btn"):
+        _cn = get_conn(); _cu = _cn.cursor()
+        _cu.execute("SELECT archivo_vigente FROM periodo_estado WHERE cliente_id=%s AND periodo=%s", (cli_id, mes_ind))
+        _rb = _cu.fetchone(); _cu.close(); _cn.close()
+        if not _rb or not _rb[0]:
+            st.error("No se encontró la balanza de ese mes.")
         else:
-            st.markdown(f"### {nombre_sel}  ·  {mes_rep[:7]}")
-            # caja al centro
-            if ind["caja_var"] is not None:
-                st.metric("Tu caja al cierre del mes", money(ind["caja"]), delta=f"{ind['caja_var']:,.0f} vs mes anterior")
-                direccion = "bajó" if ind["caja_var"] < 0 else "subió"
-                st.write(f"Tu caja {direccion} **{money(abs(ind['caja_var']))}** respecto al mes anterior.")
-            else:
-                st.metric("Tu caja al cierre del mes", money(ind["caja"]))
-                st.caption("Sin mes anterior para comparar.")
-            # tres indicadores en lenguaje de dueño
+            ind = cargar_indicadores(_rb[0], cli_id, mes_ind)
             c1, c2, c3 = st.columns(3)
             with c1:
-                st.metric("Rentabilidad del año (acumulada)", f"{ind['pretax_pct']}%" if ind["pretax_pct"] is not None else "—")
-                st.caption(sem_pretax(ind["pretax_pct"]))
+                st.caption("EJE 1 · GENERACIÓN")
+                st.metric("Pre-Tax Profit %", f"{ind['pretax_pct']}%" if ind['pretax_pct'] is not None else "—")
+                st.caption(sem_pretax(ind['pretax_pct']))
             with c2:
-                st.metric("Margen de tu operación", f"{ind['mb_pct']}%" if ind["mb_pct"] is not None else "—")
-            with c3:
-                st.metric("Brecha utilidad vs. caja", money(ind["cash_lag"]))
-                _uai = ind.get("uai"); _cl = ind.get("cash_lag")
-                if _cl is None or _uai is None:
-                    st.caption("Sin dato")
-                elif _uai <= 0:
-                    st.caption("⚪ Hay pérdida; la prioridad es la rentabilidad")
-                elif _cl > 0:
-                    st.caption("🔴 La utilidad no llegó a caja")
+                st.caption("EJE 2 · TRASLADO")
+                st.metric("Cash Lag", money(ind['cash_lag']))
+                if ind['cash_lag'] is None:
+                    st.caption("Necesita mes previo")
+                elif ind['cash_lag'] > 0:
+                    st.caption("🔴 Caja cayó más que la utilidad")
                 else:
-                    st.caption("🟢 La caja siguió a la utilidad")
-            # lectura del mes (la escribe Roberto)
-            st.markdown("**Lo que esto significa** (escríbelo para el dueño)")
-            st.text_area("Lectura del mes", key="rep_lectura",
-                         placeholder="Ej.: El negocio es rentable, pero la utilidad se quedó en cobranza. Prioridad: cobrar, no vender.",
-                         label_visibility="collapsed")
-            st.caption("Los números los pone el sistema. La lectura la escribe el CFO.")
-            st.text_input("El número más importante del mes (opcional)", key="rep_numero",
-                          placeholder="Ej.: Tu caja subió $1.7M, pero $9M siguen en cobranza.")
-            st.text_area("Las 3 acciones del mes (una por línea)", key="rep_acciones",
-                         placeholder="Cobrar la cartera vencida de obra\nFrenar compra de material sin contrato firmado\nReclasificar el crédito de corto a largo plazo")
-            st.text_area("Valor generado este mes (en pesos)", key="rep_valor",
-                         placeholder="Ej.: Recuperamos $420,000 de IVA a favor. Acumulado del año: $1.3M.")
-            try:
-                import fpdf  # noqa: F401
-                _fpdf_ok = True
-            except Exception:
-                _fpdf_ok = False
-            if not _fpdf_ok:
-                st.error("Falta la librería **fpdf2**. En GitHub: agrega una línea `fpdf2` a requirements.txt, "
-                         "guarda, y en Streamlit Cloud entra a *Manage app* y haz *Reboot*. Sin esto no se genera el PDF.")
+                    st.caption("🟢 Caja por encima de la utilidad")
+            with c3:
+                st.caption("EJE 3 · FISCAL")
+                st.metric("EIVA %", f"{ind['eiva_pct']}%" if ind['eiva_pct'] is not None else "—")
+                if ind['iva_neto'] is not None:
+                    st.caption(("IVA a cargo " + money(ind['iva_neto'])) if ind['iva_neto'] > 0
+                               else ("IVA a favor " + money(abs(ind['iva_neto']))))
+            st.subheader("Apoyo")
+            a1, a2, a3, a4 = st.columns(4)
+            a1.metric("Margen Bruto %", f"{ind['mb_pct']}%" if ind['mb_pct'] is not None else "—")
+            a2.metric("Nómina / Ingresos", f"{ind['nomina_pct']}%" if ind['nomina_pct'] is not None else "—")
+            a3.metric("GPLD", f"{ind['gpld']}x" if ind['gpld'] is not None else "n/a")
+            a4.metric("Caja fin de mes", money(ind['caja']))
+            st.subheader("Avance contra meta")
+            _metas_b = get_metas(cli_id, int(mes_ind[:4]))
+            _items_b = [("Pre-Tax Profit %", "pretax_pct", ind["pretax_pct"], "pctnum"),
+                        ("GPLD",             "gpld",       ind["gpld"],       "x"),
+                        ("Cash Lag",         "cash_lag",   ind["cash_lag"],   "pesos")]
+            _tab_b = tabla_avance_meta(_items_b, _metas_b)
+            if _tab_b:
+                st.markdown(_tab_b)
+                st.caption("Brecha firmada: negativa = falta para llegar a la meta (R-MET-02). "
+                           "Anclas duras Pre-Tax 10% y GPLD 1.35 (Crabtree); se sobrescriben por cliente desde meta_indicador.")
             else:
-                try:
-                    _res_ef = comparativo_estados(cli_id, mes_rep)
-                    _ef_a, _ef_p, _per_p = _res_ef if _res_ef else (None, None, None)
-                    _rat = ratios_mensuales(cli_id, mes_rep)
-                    _metas_c = get_metas(cli_id, int(mes_rep[:4]))
-                    _pu = st.session_state.get("pu_scenario")
-                    if _pu and _pu.get("periodo") != mes_rep[:7]:
-                        _pu = None
-                    _pdf = pdf_reporte_cliente(nombre_sel, mes_rep[:7], ind, st.session_state.get("rep_lectura", ""),
-                                               ef_a=_ef_a, ef_p=_ef_p, per_p=_per_p, rat=_rat,
-                                               numero_mes=st.session_state.get("rep_numero", ""),
-                                               acciones=st.session_state.get("rep_acciones", ""),
-                                               valor_generado=st.session_state.get("rep_valor", ""),
-                                               metas=_metas_c, poder_uno=_pu)
-                    st.download_button("📄 Descargar PDF para el cliente", data=_pdf,
-                                       file_name="Reporte_CFO_" + nombre_sel.replace(" ", "_") + "_" + mes_rep[:7] + ".pdf",
-                                       mime="application/pdf", key="rep_pdf_dl")
-                    st.caption("El PDF toma la lectura escrita arriba. Si la editas, haz clic fuera del cuadro antes de descargar.")
-                except Exception as _e:
-                    st.error("No se pudo generar el PDF: " + repr(_e))
-
-
-# ---------------------------------------------------------------------------
-# PODER DEL UNO - SIMULADOR DE PALANCAS (Scaling Up / Miltz)
-# ---------------------------------------------------------------------------
-st.divider()
-st.subheader("Poder del Uno — simulador de palancas")
-st.caption("Captura cuánto mueves cada palanca y mira el efecto en utilidad y caja, sobre la temporalidad que elijas. "
-           "El escenario calculado se pasa al PDF del cliente del mismo mes.")
-_ppu = periodos_cargados(cli_id)
-if not _ppu:
-    st.caption("Carga al menos un mes para usar el simulador.")
-else:
-    mes_pu = st.selectbox("Mes base", _ppu, key="pu_mes")
-    temp_pu = st.radio("Temporalidad", ["mensual", "ytd", "anualizado"], horizontal=True, key="pu_temp",
-                       format_func=lambda x: {"mensual": "Del mes", "ytd": "Acumulado del año", "anualizado": "Anualizado"}[x])
-    st.caption("Positivo = mejora. Precio/Volumen suben; Costo/Gastos bajan; Días por cobrar/inventario bajan; Días por pagar suben.")
-    _cu1, _cu2 = st.columns(2)
-    with _cu1:
-        pu_precio = st.number_input("Precio (% aumento)", value=1.0, step=0.5, key="pu_precio")
-        pu_vol    = st.number_input("Volumen (% aumento)", value=0.0, step=0.5, key="pu_vol")
-        pu_costo  = st.number_input("Costo de ventas (% reducción)", value=1.0, step=0.5, key="pu_costo")
-        pu_gastos = st.number_input("Gastos de operación (% reducción)", value=1.0, step=0.5, key="pu_gastos")
-    with _cu2:
-        pu_cxc = st.number_input("Días por cobrar (reducción)", value=0.0, step=5.0, key="pu_cxc")
-        pu_inv = st.number_input("Días de inventario (reducción)", value=0.0, step=5.0, key="pu_inv")
-        pu_cxp = st.number_input("Días por pagar (aumento)", value=0.0, step=5.0, key="pu_cxp")
-    if st.button("Calcular Poder del Uno"):
-        _resu = comparativo_estados(cli_id, mes_pu)
-        if not _resu:
-            st.error("No se encontró ese mes.")
-        else:
-            _efu, _efpu, _ = _resu
-            _baseu = base_poder_uno(_efu, _efpu, mes_pu[:7], temp_pu)
-            _mvu = dict(precio=pu_precio, volumen=pu_vol, costo=pu_costo, gastos=pu_gastos, cxc=pu_cxc, inv=pu_inv, cxp=pu_cxp)
-            _filas, _du, _dc, _trampa, _ub = poder_uno_tabla(_baseu, _mvu)
-            st.session_state["pu_scenario"] = dict(temporalidad=temp_pu, filas=_filas, du=_du, dc=_dc,
-                                                   trampa=_trampa, periodo=mes_pu[:7])
-            st.dataframe([{"Palanca": n, "Movimiento": mv,
-                           "Efecto": ("+" if v >= 0 else "-") + money(abs(v)), "Sobre": k} for n, mv, v, k in _filas],
-                         use_container_width=True, hide_index=True)
-            cc1, cc2 = st.columns(2)
-            cc1.metric("Cambio en utilidad", ("+" if _du >= 0 else "-") + money(abs(_du)))
-            cc2.metric("Cambio en caja", ("+" if _dc >= 0 else "-") + money(abs(_dc)))
-            if _trampa:
-                st.error("⚠️ Trampa de volumen: con margen bruto negativo (" + money(_ub) + "), vender más volumen REDUCE la utilidad. "
-                         "El sistema no lo maquilla: primero el margen, después el volumen.")
-            st.caption("Escenario guardado. Al generar el reporte del cliente de " + mes_pu[:7] + " se incluye esta página.")
+                st.caption("Sin metas definidas para este cliente/ejercicio.")
+            with st.expander("P&L de Gestión (no constituye estado de resultados NIF)"):
+                st.dataframe(
+                    [{"Concepto": c, "Monto": f"{m:,.0f}", "%": (f"{p}%" if p is not None else "")} for c, m, p in ind['pl']],
+                    use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2143,6 +2029,31 @@ else:
 
 
 # ---------------------------------------------------------------------------
+# COMPARATIVO DE MESES CARGADOS
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Tendencia de los meses cargados")
+if st.button("Ver tendencia"):
+    datos = tendencia(cli_id)
+    if not datos:
+        st.info("Este cliente no tiene meses cargados todavía.")
+    else:
+        filas = [{"Mes": d["periodo"],
+                  "Caja": money(d["caja"]),
+                  "Pre-Tax %": (f"{d['pretax']}%" if d["pretax"] is not None else "—"),
+                  "Cash Lag": money(d["cash_lag"]),
+                  "Comparable": ("⚠️ con observaciones" if d["flag"] else "✓ limpio")} for d in datos]
+        st.dataframe(filas, use_container_width=True, hide_index=True)
+        import pandas as pd
+        caja_df = pd.DataFrame([{"Mes": d["periodo"], "Caja": d["caja"]} for d in datos if d["caja"] is not None]).set_index("Mes")
+        if not caja_df.empty:
+            st.caption("Caja al cierre por mes")
+            st.line_chart(caja_df)
+        if any(d["flag"] for d in datos):
+            st.caption("⚠️ Los meses marcados traen observaciones de contabilidad (en recontabilización). La tendencia puede no reflejar la operación real hasta que se ajusten.")
+
+
+# ---------------------------------------------------------------------------
 # ELEGIBILIDAD DE LICITACIÓN / CRÉDITO (capa cliente · constructoras) — R-MET
 # ---------------------------------------------------------------------------
 st.divider()
@@ -2237,14 +2148,148 @@ else:
                         if _efp["ytd"]["ing"]:
                             _crec = _efc["ytd"]["ing"] / _efp["ytd"]["ing"] - 1
                         _rpall = ratios_mensuales(cli_id, _ciep[0] + "-01"); _rp = _rpall[0] if _rpall else None
+                _fsem = evaluar_fiscal(cli_id, _cie[0] + "-01") if _cie else None
                 try:
                     _pdfint = pdf_interno_2025(nombre_sel, anio_int, serie,
                                                ef_cierre=_efc, dias_cierre=_diasc, crecimiento=_crec,
                                                ef_cierre_prev=_efp, rat_now=_rn, rat_prev=_rp,
-                                               datos_cliente=get_cliente_csf(cli_id))
+                                               datos_cliente=get_cliente_csf(cli_id), fiscal_sem=_fsem)
                     st.download_button("📄 Descargar reporte interno", data=_pdfint,
                                        file_name="Reporte_Interno_" + nombre_sel.replace(" ", "_") + "_" + str(anio_int) + ".pdf",
                                        mime="application/pdf", key="int_dl")
                     st.success("Reporte interno generado con " + str(len(serie)) + " meses del ejercicio " + str(anio_int) + ".")
                 except Exception as _e:
                     st.error("No se pudo generar el reporte interno: " + repr(_e))
+# ---------------------------------------------------------------------------
+# PODER DEL UNO - SIMULADOR DE PALANCAS (Scaling Up / Miltz)
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Poder del Uno — simulador de palancas")
+st.caption("Captura cuánto mueves cada palanca y mira el efecto en utilidad y caja, sobre la temporalidad que elijas. "
+           "El escenario calculado se pasa al PDF del cliente del mismo mes.")
+_ppu = periodos_cargados(cli_id)
+if not _ppu:
+    st.caption("Carga al menos un mes para usar el simulador.")
+else:
+    mes_pu = st.selectbox("Mes base", _ppu, key="pu_mes")
+    temp_pu = st.radio("Temporalidad", ["mensual", "ytd", "anualizado"], horizontal=True, key="pu_temp",
+                       format_func=lambda x: {"mensual": "Del mes", "ytd": "Acumulado del año", "anualizado": "Anualizado"}[x])
+    st.caption("Positivo = mejora. Precio/Volumen suben; Costo/Gastos bajan; Días por cobrar/inventario bajan; Días por pagar suben.")
+    _cu1, _cu2 = st.columns(2)
+    with _cu1:
+        pu_precio = st.number_input("Precio (% aumento)", value=1.0, step=0.5, key="pu_precio")
+        pu_vol    = st.number_input("Volumen (% aumento)", value=0.0, step=0.5, key="pu_vol")
+        pu_costo  = st.number_input("Costo de ventas (% reducción)", value=1.0, step=0.5, key="pu_costo")
+        pu_gastos = st.number_input("Gastos de operación (% reducción)", value=1.0, step=0.5, key="pu_gastos")
+    with _cu2:
+        pu_cxc = st.number_input("Días por cobrar (reducción)", value=0.0, step=5.0, key="pu_cxc")
+        pu_inv = st.number_input("Días de inventario (reducción)", value=0.0, step=5.0, key="pu_inv")
+        pu_cxp = st.number_input("Días por pagar (aumento)", value=0.0, step=5.0, key="pu_cxp")
+    if st.button("Calcular Poder del Uno"):
+        _resu = comparativo_estados(cli_id, mes_pu)
+        if not _resu:
+            st.error("No se encontró ese mes.")
+        else:
+            _efu, _efpu, _ = _resu
+            _baseu = base_poder_uno(_efu, _efpu, mes_pu[:7], temp_pu)
+            _mvu = dict(precio=pu_precio, volumen=pu_vol, costo=pu_costo, gastos=pu_gastos, cxc=pu_cxc, inv=pu_inv, cxp=pu_cxp)
+            _filas, _du, _dc, _trampa, _ub = poder_uno_tabla(_baseu, _mvu)
+            st.session_state["pu_scenario"] = dict(temporalidad=temp_pu, filas=_filas, du=_du, dc=_dc,
+                                                   trampa=_trampa, periodo=mes_pu[:7])
+            st.dataframe([{"Palanca": n, "Movimiento": mv,
+                           "Efecto": ("+" if v >= 0 else "-") + money(abs(v)), "Sobre": k} for n, mv, v, k in _filas],
+                         use_container_width=True, hide_index=True)
+            cc1, cc2 = st.columns(2)
+            cc1.metric("Cambio en utilidad", ("+" if _du >= 0 else "-") + money(abs(_du)))
+            cc2.metric("Cambio en caja", ("+" if _dc >= 0 else "-") + money(abs(_dc)))
+            if _trampa:
+                st.error("⚠️ Trampa de volumen: con margen bruto negativo (" + money(_ub) + "), vender más volumen REDUCE la utilidad. "
+                         "El sistema no lo maquilla: primero el margen, después el volumen.")
+            st.caption("Escenario guardado. Al generar el reporte del cliente de " + mes_pu[:7] + " se incluye esta página.")
+
+
+# ---------------------------------------------------------------------------
+# REPORTE DEL CLIENTE (vista dueño)
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Reporte del cliente")
+_periodos = periodos_cargados(cli_id)
+if not _periodos:
+    st.caption("Carga al menos un mes para generar el reporte del cliente.")
+else:
+    mes_rep = st.selectbox("Mes a reportar", _periodos, key="rep_mes")
+    if st.button("Generar reporte del cliente"):
+        st.session_state["rep_generado"] = mes_rep
+    if st.session_state.get("rep_generado") == mes_rep:
+        ind = datos_reporte_cliente(cli_id, mes_rep)
+        if ind is None:
+            st.error("No se encontró ese mes.")
+        else:
+            st.markdown(f"### {nombre_sel}  ·  {mes_rep[:7]}")
+            # caja al centro
+            if ind["caja_var"] is not None:
+                st.metric("Tu caja al cierre del mes", money(ind["caja"]), delta=f"{ind['caja_var']:,.0f} vs mes anterior")
+                direccion = "bajó" if ind["caja_var"] < 0 else "subió"
+                st.write(f"Tu caja {direccion} **{money(abs(ind['caja_var']))}** respecto al mes anterior.")
+            else:
+                st.metric("Tu caja al cierre del mes", money(ind["caja"]))
+                st.caption("Sin mes anterior para comparar.")
+            # tres indicadores en lenguaje de dueño
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Rentabilidad del año (acumulada)", f"{ind['pretax_pct']}%" if ind["pretax_pct"] is not None else "—")
+                st.caption(sem_pretax(ind["pretax_pct"]))
+            with c2:
+                st.metric("Margen de tu operación", f"{ind['mb_pct']}%" if ind["mb_pct"] is not None else "—")
+            with c3:
+                st.metric("Brecha utilidad vs. caja", money(ind["cash_lag"]))
+                _uai = ind.get("uai"); _cl = ind.get("cash_lag")
+                if _cl is None or _uai is None:
+                    st.caption("Sin dato")
+                elif _uai <= 0:
+                    st.caption("⚪ Hay pérdida; la prioridad es la rentabilidad")
+                elif _cl > 0:
+                    st.caption("🔴 La utilidad no llegó a caja")
+                else:
+                    st.caption("🟢 La caja siguió a la utilidad")
+            # lectura del mes (la escribe Roberto)
+            st.markdown("**Lo que esto significa** (escríbelo para el dueño)")
+            st.text_area("Lectura del mes", key="rep_lectura",
+                         placeholder="Ej.: El negocio es rentable, pero la utilidad se quedó en cobranza. Prioridad: cobrar, no vender.",
+                         label_visibility="collapsed")
+            st.caption("Los números los pone el sistema. La lectura la escribe el CFO.")
+            st.text_input("El número más importante del mes (opcional)", key="rep_numero",
+                          placeholder="Ej.: Tu caja subió $1.7M, pero $9M siguen en cobranza.")
+            st.text_area("Las 3 acciones del mes (una por línea)", key="rep_acciones",
+                         placeholder="Cobrar la cartera vencida de obra\nFrenar compra de material sin contrato firmado\nReclasificar el crédito de corto a largo plazo")
+            st.text_area("Valor generado este mes (en pesos)", key="rep_valor",
+                         placeholder="Ej.: Recuperamos $420,000 de IVA a favor. Acumulado del año: $1.3M.")
+            try:
+                import fpdf  # noqa: F401
+                _fpdf_ok = True
+            except Exception:
+                _fpdf_ok = False
+            if not _fpdf_ok:
+                st.error("Falta la librería **fpdf2**. En GitHub: agrega una línea `fpdf2` a requirements.txt, "
+                         "guarda, y en Streamlit Cloud entra a *Manage app* y haz *Reboot*. Sin esto no se genera el PDF.")
+            else:
+                try:
+                    _res_ef = comparativo_estados(cli_id, mes_rep)
+                    _ef_a, _ef_p, _per_p = _res_ef if _res_ef else (None, None, None)
+                    _rat = ratios_mensuales(cli_id, mes_rep)
+                    _metas_c = get_metas(cli_id, int(mes_rep[:4]))
+                    _pu = st.session_state.get("pu_scenario")
+                    if _pu and _pu.get("periodo") != mes_rep[:7]:
+                        _pu = None
+                    _pdf = pdf_reporte_cliente(nombre_sel, mes_rep[:7], ind, st.session_state.get("rep_lectura", ""),
+                                               ef_a=_ef_a, ef_p=_ef_p, per_p=_per_p, rat=_rat,
+                                               numero_mes=st.session_state.get("rep_numero", ""),
+                                               acciones=st.session_state.get("rep_acciones", ""),
+                                               valor_generado=st.session_state.get("rep_valor", ""),
+                                               metas=_metas_c, poder_uno=_pu)
+                    st.download_button("📄 Descargar PDF para el cliente", data=_pdf,
+                                       file_name="Reporte_CFO_" + nombre_sel.replace(" ", "_") + "_" + mes_rep[:7] + ".pdf",
+                                       mime="application/pdf", key="rep_pdf_dl")
+                    st.caption("El PDF toma la lectura escrita arriba. Si la editas, haz clic fuera del cuadro antes de descargar.")
+                except Exception as _e:
+                    st.error("No se pudo generar el PDF: " + repr(_e))
