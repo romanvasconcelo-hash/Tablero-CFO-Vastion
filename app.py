@@ -1007,6 +1007,24 @@ SAT_LBL = {
 }
 def _lbl(code): return SAT_LBL.get(code, "Agrupador " + (code or "?"))
 
+def _fiscal_buckets(acc, saldo_g):
+    """Identifica no deducible y accesorios DESDE contabilidad, por subcódigo agrupador SAT (YTD). R-FIS-04/08.
+    Permanente = recargos (6xx.59) + multas/sanciones/actualización (6xx.84).
+    Sin requisitos = 6xx.83 / 6xx.81. No deducible CUFIN = 612. ISR provisional pagado = agrupador 114."""
+    def _ssf(x): return x['sf'] if x['nat'] == 'D' else -x['sf']
+    def _suf(ag):
+        p = (ag or '').split('.'); return p[1] if len(p) > 1 else ''
+    s6 = [x for x in acc if (x['ag'] or '')[:1] == '6']
+    recargos = sum(_ssf(x) for x in s6 if _suf(x['ag']) == '59')
+    multas   = sum(_ssf(x) for x in s6 if _suf(x['ag']) == '84')
+    sinreq   = sum(_ssf(x) for x in s6 if _suf(x['ag']) in ('83', '81'))
+    cufin    = sum(_ssf(x) for x in s6 if (x['ag'] or '')[:3] == '612')
+    gas_total = sum(_ssf(x) for x in s6 if (x['ag'] or '')[:3] not in ('612', '613', '614'))
+    return dict(nd_recargos=recargos, nd_multas=multas, nd_permanente=recargos + multas,
+                nd_sinreq=sinreq, nd_cufin=cufin, gas_total=gas_total,
+                isr_prov=saldo_g.get('114', 0.0),
+                hay_multas_recargos=(abs(recargos) >= 1 or abs(multas) >= 1))
+
 def estados_financieros(archivo_id):
     """ER (NIF) + Balance General + EFE (indirecto) por partida. Lógica validada en datos reales."""
     from collections import defaultdict
@@ -1150,7 +1168,7 @@ def estados_financieros(archivo_id):
     inv_inmovil = sum(v for ag,v in cierre_sig.items() if '115' <= ag[:3] <= '129' and abs(_yd(ag)) < 1)
     cash = dict(uai=ytd['uai'], dep=ytd['dep'], capex=capex, opcap=opcap, opcap_ini=opcap_ini,
                 dopcap=dopcap, generador=generador, isr_prov=isr_prov, un=ytd['un'], inv_inmovil=inv_inmovil)
-    return dict(er=er, bg=bg, efe=efe, ytd=ytd, cash=cash)
+    return dict(er=er, bg=bg, efe=efe, ytd=ytd, cash=cash, fiscal=_fiscal_buckets(acc, saldo_g))
 
 def _fmt(v):
     if v is None: return "—"
@@ -1872,6 +1890,47 @@ else:
                 st.markdown("\n".join(fil))
                 if abs(efe["plug"]) < 1: st.success("EFE cuadrado (partida por identificar $0).")
                 else: st.warning("Partida por identificar: " + _fmt(efe["plug"]) + ".")
+
+
+# ---------------------------------------------------------------------------
+# CAPA FISCAL - IDENTIFICACION DEL NO DEDUCIBLE (desde contabilidad)
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Capa fiscal — no deducible (identificado desde contabilidad)")
+st.caption("Lectura automática por subcódigo agrupador SAT. No clasifica recuperable vs. perdido (eso es captura fiscal posterior); "
+           "solo identifica lo que la contabilidad ya separa. Base YTD del ejercicio.")
+_pfis = periodos_cargados(cli_id)
+if not _pfis:
+    st.caption("Carga al menos un mes.")
+else:
+    mes_fis = st.selectbox("Mes", _pfis, key="fis_mes")
+    if st.button("Identificar no deducible", key="fis_btn"):
+        _rf = comparativo_estados(cli_id, mes_fis)
+        if not _rf:
+            st.error("No se encontró la balanza de ese mes.")
+        else:
+            _eff = _rf[0]["fiscal"]
+            _gt = _eff["gas_total"] or 0
+            _pp = (_eff["nd_permanente"] / _gt * 100) if _gt else 0
+            _ps = (_eff["nd_sinreq"] / _gt * 100) if _gt else 0
+            f1, f2, f3 = st.columns(3)
+            f1.metric("No deducible permanente", money(_eff["nd_permanente"]),
+                      delta=f"{_pp:.1f}% del gasto", delta_color="off")
+            f1.caption("Recargos " + money(_eff["nd_recargos"]) + " + multas/sanciones " + money(_eff["nd_multas"]))
+            f2.metric("No deducible sin requisitos", money(_eff["nd_sinreq"]),
+                      delta=f"{_ps:.1f}% del gasto", delta_color="off")
+            f2.caption("Identificado; recuperable o perdido se define en captura fiscal.")
+            f3.metric("ISR provisional pagado (YTD)", money(_eff["isr_prov"]))
+            f3.caption("No deducible CUFIN: " + money(_eff["nd_cufin"]))
+            if _eff["hay_multas_recargos"]:
+                st.error("🔴 Control 2 (R-FIS-08): hay multas/recargos contabilizados (" +
+                         money(_eff["nd_permanente"]) + "). Es no deducible permanente y señal de falla de cumplimiento. "
+                         "Acción facturable: diagnóstico de causa raíz + Programa Cero Recargos.")
+            elif _pp > 3:
+                st.warning("🟡 No deducible permanente > 3% del gasto. Revisar.")
+            else:
+                st.success("🟢 Sin multas/recargos contabilizados en el periodo.")
+            st.caption("Para CKT, la etiqueta contable del ISN aún dice '3%'; la ley NL 2026 es 4%. Recosteo de obra pendiente.")
 
 
 # ---------------------------------------------------------------------------
