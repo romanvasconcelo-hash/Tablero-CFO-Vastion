@@ -216,6 +216,130 @@ def _efe_diag(efe):
            "Revisar la clasificacion de agrupadores de financiamiento/inversion."
  
  
+# ---------------------------------------------------------------------------
+# REPORTE INTERNO · Comportamiento del ejercicio (tendencia + resumen)
+# ---------------------------------------------------------------------------
+# Spec unica: alimenta la grafica y la tabla resumen (DRY). meta y dir solo en anclas duras.
+SERIE_SPEC = [
+    ("Rentabilidad (Pre-Tax %)", "pretax", "pct",     10.0, "mayor"),   # Crabtree
+    ("Margen bruto %",           "mb",     "pct",     None, None),       # segun sector
+    ("Liquidez (AC / PC)",       "ac_pc",  "x",       1.1,  "mayor"),    # licitacion
+    ("Capital de trabajo",       "cnt",    "money",   0.0,  "mayor"),    # piso: positivo
+    ("Caja al cierre",           "caja",   "money",   None, None),
+    ("Endeudamiento (PT / AT)",  "pt_at",  "pctfrac", 0.70, "menor"),    # licitacion
+]
+ 
+def serie_anual(cli, anio):
+    """Recorre los meses cargados del ejercicio y arma la serie de indicadores clave."""
+    import datetime as _dt
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""SELECT periodo, archivo_vigente FROM periodo_estado
+                       WHERE cliente_id=%s AND archivo_vigente IS NOT NULL
+                         AND periodo >= %s AND periodo <= %s ORDER BY periodo""",
+                    (cli, _dt.date(anio,1,1), _dt.date(anio,12,1)))
+        rows = cur.fetchall()
+    finally:
+        cur.close(); conn.close()
+    serie = []
+    for per, arch in rows:
+        ef = estados_financieros(arch); s = _stocks_de(ef); y = ef["ytd"]
+        ing = y["ing"]
+        serie.append(dict(
+            mes=str(per)[:7],
+            pretax=(y["uai"]/ing*100) if ing else None,
+            mb=(y["ub"]/ing*100) if ing else None,
+            ac_pc=(s["act_circ"]/s["pas_circ"]) if s["pas_circ"] else None,
+            cnt=s["act_circ"]-s["pas_circ"],
+            caja=ef["efe"]["efec_fin"],
+            pt_at=(s["pasivo"]/s["activo"]) if s["activo"] else None,
+        ))
+    return serie
+ 
+def _fig_tendencia(serie):
+    """Panel 2x3 de tendencia del ejercicio -> PNG bytes. Linea de meta punteada donde hay ancla."""
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import io as _io
+    DARK="#1c2d3a"; ACC="#2c3e50"; RED="#c0392b"
+    meses = [d["mes"][5:7] for d in serie]; x = list(range(len(serie)))
+    fig, axes = plt.subplots(2, 3, figsize=(11, 6))
+    for ax, (titulo, key, fmt, meta, _dir) in zip(axes.flat, SERIE_SPEC):
+        ys = [d[key] for d in serie]
+        yv = [(float("nan") if v is None else (v/1e6 if fmt=="money" else (v*100 if fmt=="pctfrac" else v))) for v in ys]
+        ax.plot(x, yv, marker="o", ms=3, lw=1.6, color=DARK)
+        if meta is not None:
+            ml = meta/1e6 if fmt=="money" else (meta*100 if fmt=="pctfrac" else meta)
+            ax.axhline(ml, ls="--", lw=1.0, color=RED)
+        suf = " ($M)" if fmt=="money" else ("" )
+        ax.set_title(titulo+suf, fontsize=9, color=ACC, loc="left")
+        ax.set_xticks(x); ax.set_xticklabels(meses, fontsize=6)
+        ax.tick_params(axis="y", labelsize=6)
+        for sp in ("top","right"): ax.spines[sp].set_visible(False)
+        ax.grid(axis="y", lw=0.3, alpha=0.4)
+    fig.tight_layout(pad=1.2)
+    buf = _io.BytesIO(); fig.savefig(buf, format="png", dpi=150); plt.close(fig)
+    return buf.getvalue()
+ 
+def _fserie(v, fmt):
+    if v is None: return "-"
+    if fmt=="pct":     return "{:.1f}%".format(v)
+    if fmt=="x":       return "{:.2f}x".format(v)
+    if fmt=="money":   return _fmt(v)
+    if fmt=="pctfrac": return "{:.1f}%".format(v*100)
+    return "{:.2f}".format(v)
+ 
+def pdf_interno_2025(nombre, anio, serie):
+    """Reporte interno: header + grafica de tendencia + tabla resumen (apertura/cierre/promedio)."""
+    from fpdf import FPDF
+    import io as _io
+    def t(s):
+        return (str(s).replace("\u2014","-").replace("\u2013","-").replace("\u2212","-")
+                .encode("latin-1","replace").decode("latin-1"))
+    W, Mg = 210, 12; CW = W - 2*Mg
+    pdf = FPDF(orientation="P", unit="mm", format="A4"); pdf.set_auto_page_break(True, 15); pdf.add_page()
+    pdf.set_fill_color(28,45,58); pdf.rect(0,0,W,26,style="F")
+    pdf.set_text_color(255,255,255); pdf.set_xy(Mg,7); pdf.set_font("Helvetica","B",16)
+    pdf.cell(CW,8,t("Reporte interno - Comportamiento " + str(anio)))
+    pdf.set_xy(Mg,16); pdf.set_font("Helvetica","",10)
+    pdf.cell(CW,6,t(nombre + "   |   uso interno Vastion   |   acumulado del ejercicio (YTD)"))
+    # grafica
+    png = _fig_tendencia(serie)
+    pdf.image(_io.BytesIO(png), x=Mg, y=31, w=CW)
+    yt = 31 + CW*6.0/11.0 + 6
+    # tabla resumen
+    pdf.set_xy(Mg, yt); pdf.set_text_color(44,62,80); pdf.set_font("Helvetica","B",12)
+    pdf.cell(CW,7,t("Resumen del ejercicio")); pdf.ln(9)
+    pdf.set_x(Mg); pdf.set_text_color(127,140,141); pdf.set_font("Helvetica","B",8)
+    for w,txt,al in [(60,"Indicador","L"),(26,"Apertura","R"),(26,"Cierre","R"),(26,"Promedio","R"),(22,"Meta","R"),(26,"Estado","R")]:
+        pdf.cell(w,6,t(txt),align=al)
+    pdf.ln(6)
+    for titulo, key, fmt, meta, dirn in SERIE_SPEC:
+        vals = [d[key] for d in serie if d[key] is not None]
+        ap = vals[0] if vals else None; ci = vals[-1] if vals else None
+        pr = (sum(vals)/len(vals)) if vals else None
+        if meta is None or ci is None:
+            edo = "-"
+        else:
+            signo = -1 if dirn=="menor" else 1
+            edo = "Cumple" if (ci-meta)*signo >= 0 else "Falta"
+        pdf.set_x(Mg); pdf.set_text_color(44,62,80); pdf.set_font("Helvetica","",8)
+        pdf.cell(60,5.5,t(titulo),align="L")
+        pdf.cell(26,5.5,t(_fserie(ap,fmt)),align="R")
+        pdf.cell(26,5.5,t(_fserie(ci,fmt)),align="R")
+        pdf.cell(26,5.5,t(_fserie(pr,fmt)),align="R")
+        pdf.cell(22,5.5,t(_fserie(meta,fmt) if meta is not None else "-"),align="R")
+        if edo=="Falta": pdf.set_text_color(192,57,43)
+        elif edo=="Cumple": pdf.set_text_color(39,174,96)
+        else: pdf.set_text_color(127,140,141)
+        pdf.cell(26,5.5,t(edo),align="R"); pdf.ln(5.5)
+    pdf.ln(3); pdf.set_text_color(127,140,141); pdf.set_font("Helvetica","",7.5)
+    pdf.multi_cell(CW,3.6,t("Apertura = primer mes cargado; Cierre = ultimo mes; Promedio = media de los meses. "
+                            "Metas: Pre-Tax 10% y liquidez/endeudamiento por parametros de licitacion federal. "
+                            "Para clientes en recontabilizacion (Fase 0) la serie es diagnostico, no linea base valida (R-MET-06)."))
+    return bytes(pdf.output())
+ 
+ 
 def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per_p=None, rat=None):
     """Reporte CFO mensual del cliente en PDF (una página). Caja al centro."""
     from fpdf import FPDF
@@ -1320,3 +1444,40 @@ else:
             st.caption("Brecha firmada: negativa = falta para llegar a la meta (R-MET-02). "
                        "Diagnóstico sobre la posición del mes; para clientes en recontabilización (Fase 0) "
                        "las razones del balance no son certificables hasta cerrar (R-MET-06).")
+ 
+ 
+# ---------------------------------------------------------------------------
+# REPORTE INTERNO (comportamiento del ejercicio · uso Vastion)
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Reporte interno — comportamiento del ejercicio")
+st.caption("Uso interno Vastion. Gráficas de tendencia de los indicadores clave + resumen del año "
+           "(apertura / cierre / promedio). Para clientes en Fase 0 es diagnóstico, no línea base válida.")
+_pint = periodos_cargados(cli_id)
+if not _pint:
+    st.caption("Carga al menos un mes para generar el reporte interno.")
+else:
+    _anios = sorted({int(p[:4]) for p in _pint}, reverse=True)
+    anio_int = st.selectbox("Ejercicio", _anios, key="int_anio")
+    if st.button("Generar reporte interno", key="int_gen"):
+        try:
+            import matplotlib  # noqa: F401
+            _mpl_ok = True
+        except Exception:
+            _mpl_ok = False
+        if not _mpl_ok:
+            st.error("Falta la librería **matplotlib**. En GitHub agrega una línea `matplotlib` a requirements.txt, "
+                     "guarda, y en Streamlit Cloud entra a *Manage app* y haz *Reboot*.")
+        else:
+            serie = serie_anual(cli_id, anio_int)
+            if not serie:
+                st.warning("No hay meses cargados para el ejercicio " + str(anio_int) + ".")
+            else:
+                try:
+                    _pdfint = pdf_interno_2025(nombre_sel, anio_int, serie)
+                    st.download_button("📄 Descargar reporte interno", data=_pdfint,
+                                       file_name="Reporte_Interno_" + nombre_sel.replace(" ", "_") + "_" + str(anio_int) + ".pdf",
+                                       mime="application/pdf", key="int_dl")
+                    st.success("Reporte interno generado con " + str(len(serie)) + " meses del ejercicio " + str(anio_int) + ".")
+                except Exception as _e:
+                    st.error("No se pudo generar el reporte interno: " + repr(_e))
