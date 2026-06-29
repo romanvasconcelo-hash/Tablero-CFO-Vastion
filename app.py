@@ -1,3 +1,4 @@
+
 # ============================================================================
 # TABLERO CFO VASTION · App de Roberto  v0.3
 # Carga + validación + REPORTE INTERNO de indicadores.
@@ -198,6 +199,24 @@ def money(v):
     return "—" if v is None else f"${v:,.0f}"
  
  
+def _efe_diag(efe):
+    """R-EFE-01 -> (cuadra, causa, accion). Traduce el descuadre a la causa raiz y la accion."""
+    if efe.get("cuadra", True):
+        return True, "", ""
+    plug = efe.get("plug", 0.0); apd = efe.get("ap_descuadre", 0.0); apr = efe.get("ap_resultado", 0.0)
+    if not efe.get("base_anual", False):
+        return False, "Flujo mensual sin base anual: falta enero del ejercicio para evaluar la apertura.", \
+               "Cargar la balanza de enero del ejercicio."
+    if abs(apr) >= 1:
+        return False, "Ejercicio anterior sin cerrar: las cuentas de resultados abren en " + _fmt(apr) + " (deben abrir en cero).", \
+               "Cerrar el ejercicio anterior (llevar el resultado a ejercicios anteriores) antes de reportar."
+    if abs(apd) >= 1:
+        return False, "La apertura del ejercicio no cuadra por " + _fmt(apd) + " (el balance inicial no suma cero).", \
+               "Revisar la captura/cierre de la apertura del ejercicio."
+    return False, "El flujo no cuadra por " + _fmt(plug) + " con apertura correcta: un agrupador mueve efectivo sin origen.", \
+           "Revisar la clasificacion de agrupadores de financiamiento/inversion."
+ 
+ 
 def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per_p=None, rat=None):
     """Reporte CFO mensual del cliente en PDF (una página). Caja al centro."""
     from fpdf import FPDF
@@ -332,6 +351,15 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
         _banner_anexo("Anexo - Estados financieros  ·  " + periodo,
                       "ER y EFE en acumulado del ejercicio (YTD); Balance en posicion del mes. "
                       "Para clientes en recontabilizacion son diagnostico interno hasta cerrar Fase 0.")
+        ok_efe, causa_efe, acc_efe = _efe_diag(ef_a["efe"])
+        if not ok_efe:
+            yb = pdf.get_y()
+            pdf.set_fill_color(192, 57, 43); pdf.rect(Mg, yb, CW, 8, style="F")
+            pdf.set_xy(Mg + 2, yb + 1.5); pdf.set_text_color(255, 255, 255); pdf.set_font("Helvetica", "B", 9)
+            pdf.cell(CW - 4, 5, t("ESTADOS RETENIDOS - R-EFE-01: el flujo de efectivo no cuadra"))
+            pdf.set_xy(Mg, yb + 9); pdf.set_text_color(192, 57, 43); pdf.set_font("Helvetica", "", 7.5)
+            pdf.multi_cell(CW, 3.6, t(causa_efe + "  Accion: " + acc_efe))
+            pdf.ln(2); pdf.set_text_color(0, 0, 0)
         dual = ef_p is not None
         _estado("Estado de Resultados", er_rows_cmp(ef_a, ef_p), dual, periodo, cp_lbl)
         _estado("Balance General", bg_rows_cmp(ef_a, ef_p), dual, periodo, cp_lbl)
@@ -449,22 +477,35 @@ def estados_financieros(archivo_id):
         rows = cur.fetchall()
         cur.execute("SELECT cliente_id, periodo FROM insumos_balanza WHERE archivo_id=%s LIMIT 1", (archivo_id,))
         meta = cur.fetchone()
-        ystart = {}
+        ene_rows = None
         if meta:
             import datetime as _dt
             cur.execute("SELECT archivo_vigente FROM periodo_estado WHERE cliente_id=%s AND periodo=%s",
                         (meta[0], _dt.date(meta[1].year, 1, 1)))
             _en = cur.fetchone()
             if _en and _en[0]:
-                cur.execute("SELECT num_cuenta, saldo_inicial FROM raw_balanza WHERE archivo_id=%s", (_en[0],))
-                ystart = {nc: float(s2 or 0) for nc, s2 in cur.fetchall()}
+                cur.execute("""SELECT i.cod_agrupador, i.naturaleza::text, r.saldo_inicial
+                               FROM insumos_balanza i
+                               JOIN raw_balanza r ON r.archivo_id=i.archivo_id AND r.num_cuenta=i.num_cuenta
+                               WHERE i.archivo_id=%s AND i.es_hoja AND NOT i.es_orden""", (_en[0],))
+                ene_rows = cur.fetchall()
     finally:
         cur.close(); conn.close()
     acc = [dict(ag=(a or ''), g=(a or '')[:3], nat=(n or ''), sf=float(sf or 0),
                 si=float(si or 0), d=float(d or 0), h=float(h or 0), num=nc)
            for a,n,sf,si,d,h,nc in rows]
-    def _yst(x):
-        return ystart.get(x['num'], 0.0) if ystart else x['si']
+    def sg(v, nat): return v if nat == 'D' else -v
+    # Posiciones firmadas por AGRUPADOR (no por número de cuenta): robusto a renumeración.
+    cierre_sig = defaultdict(float)
+    for _x in acc: cierre_sig[_x['ag']] += sg(_x['sf'], _x['nat'])
+    apertura_sig = defaultdict(float)
+    if ene_rows is not None:
+        base_anual = True
+        for _a, _n, _si in ene_rows: apertura_sig[_a or ''] += sg(float(_si or 0), _n or '')
+    else:
+        base_anual = False
+        for _x in acc: apertura_sig[_x['ag']] += sg(_x['si'], _x['nat'])
+    def _yd(ag): return cierre_sig.get(ag, 0.0) - apertura_sig.get(ag, 0.0)
     p1 = lambda x: x['ag'][:1]
     DEP = ('159','171','172','613','614')
     # ---- Estado de Resultados (todo 4/5/6/7) ----
@@ -478,8 +519,6 @@ def estados_financieros(archivo_id):
     er = dict(ing=ing, cos=cos, ub=ing-cos, gas=gas, dep=dep, fin=fin, uai=uai)
     # ---- firmas ----
     ssf = lambda x: x['sf'] if x['nat']=='D' else -x['sf']
-    def ce(x):
-        delta = x['sf']-_yst(x); return -delta if x['nat']=='D' else delta
     res_ytd = -sum(ssf(x) for x in acc if p1(x) in ('4','5','6','7'))
     ing_y = -sum(ssf(x) for x in acc if p1(x)=='4')
     cos_y = sum(ssf(x) for x in acc if p1(x)=='5')
@@ -517,47 +556,53 @@ def estados_financieros(archivo_id):
         if ag[:1]=='3': return 'FIN'
         return 'OTRO'
     efe_acc = defaultdict(float)
-    for x in acc:
-        if p1(x) in ('4','5','6','7'): continue
-        k = actividad(x['ag'])
-        if k=='EF': continue
-        efe_acc[(k, x['g'])] += ce(x)
+    for ag in set(cierre_sig) | set(apertura_sig):
+        if ag[:1] in ('4','5','6','7'): continue      # resultados -> entran vía UAI
+        k = actividad(ag)
+        if k == 'EF': continue                          # efectivo -> se reporta como saldo, no como flujo
+        efe_acc[(k, ag[:3])] += -_yd(ag)                # efecto en caja = -(cambio firmado del agrupador)
     show = lambda K: [(_lbl(g), v) for (k,g),v in sorted(efe_acc.items()) if k==K and abs(v)>=1]
     op_l, inv_l, fin_l = show('OP'), show('INV'), show('FIN')
     op_sum  = sum(v for (k,g),v in efe_acc.items() if k=='OP')
     inv_tot = sum(v for (k,g),v in efe_acc.items() if k=='INV')
     fin_tot = sum(v for (k,g),v in efe_acc.items() if k=='FIN')
     op_tot  = ytd['uai'] + op_sum
-    efec_ini = sum(_yst(x) for x in acc if x['ag'][:3] in ('101','102','103'))
-    efec_fin = sum(x['sf'] for x in acc if x['ag'][:3] in ('101','102','103'))
+    efec_ini = sum(v for ag,v in apertura_sig.items() if ag[:3] in ('101','102','103'))
+    efec_fin = sum(v for ag,v in cierre_sig.items()   if ag[:3] in ('101','102','103'))
     dcash = efec_fin - efec_ini
-    suma = op_tot+inv_tot+fin_tot
+    suma = op_tot + inv_tot + fin_tot
+    plug = efec_fin - (efec_ini + suma)
+    # R-EFE-01: el flujo cuadra a tolerancia de redondeo o se retiene.
+    ap_descuadre = sum(apertura_sig.values())                                  # apertura del ejercicio debe sumar ~0
+    ap_resultado = sum(v for ag,v in apertura_sig.items() if ag[:1] in ('4','5','6','7'))  # !=0 => ejercicio anterior sin cerrar
+    if base_anual:
+        # R-EFE-01: cuadra solo si el flujo cierra, la apertura suma cero y los resultados de apertura están en cero.
+        cuadra = abs(plug) < 1.0 and abs(ap_descuadre) < 1.0 and abs(ap_resultado) < 1.0
+    else:
+        cuadra = abs(plug) < 1.0   # sin enero cargado: solo cuadre mensual; la apertura del ejercicio no se evalúa
     efe = dict(uai=ytd['uai'], op_l=op_l, inv_l=inv_l, fin_l=fin_l, op_sum=op_sum,
                op_tot=op_tot, inv_tot=inv_tot, fin_tot=fin_tot,
                suma=suma, dcash=dcash, efec_ini=efec_ini, efec_fin=efec_fin,
-               plug=efec_fin-(efec_ini+suma),
+               plug=plug, cuadra=cuadra, ap_descuadre=ap_descuadre, ap_resultado=ap_resultado,
+               base_anual=base_anual,
                acc={("%s|%s" % (k, g)): v for (k, g), v in efe_acc.items()})
     # ---- ISR provisional: cuenta contable, agrupador 114 "Pagos provisionales" (leído de balanza) ----
     AG_ISR_PROV = '114'
     isr_prov = sum(x['sf'] for x in acc if x['g'] == AG_ISR_PROV)
     ytd['isr_prov'] = isr_prov
     ytd['un'] = ytd['uai'] - isr_prov
-    # ---- Generador de Efectivo (Cash Effectiveness, Alexander) · YTD ----
-    def _sg(v, nat): return v if nat == 'D' else -v
-    def _dssf(x): return _sg(x['sf'], x['nat']) - _sg(_yst(x), x['nat'])
-    capex = sum(_dssf(x) for x in acc
-                if '150' <= x['g'] <= '184' and x['g'] not in ('159', '171', '172'))
-    def _es_opcap(x):
-        cur_act = x['g'][:1] == '1' and x['g'] < '150'
-        cur_pas = x['g'][:1] == '2' and x['g'] < '250'
-        return (cur_act or cur_pas) and actividad(x['ag']) == 'OP'
-    opcap     = sum(_sg(x['sf'],   x['nat']) for x in acc if _es_opcap(x))
-    opcap_ini = sum(_sg(_yst(x),   x['nat']) for x in acc if _es_opcap(x))
+    # ---- Generador de Efectivo (Cash Effectiveness, Alexander) · YTD · por agrupador ----
+    capex = sum(_yd(ag) for ag in cierre_sig if '150' <= ag[:3] <= '184' and ag[:3] not in ('159', '171', '172'))
+    def _es_opcap_ag(ag):
+        cur_act = ag[:1] == '1' and ag[:3] < '150'
+        cur_pas = ag[:1] == '2' and ag[:3] < '250'
+        return (cur_act or cur_pas) and actividad(ag) == 'OP'
+    opcap     = sum(v for ag,v in cierre_sig.items()   if _es_opcap_ag(ag))
+    opcap_ini = sum(v for ag,v in apertura_sig.items() if _es_opcap_ag(ag))
     dopcap = opcap - opcap_ini
     generador = ytd['uai'] + ytd['dep'] - capex - dopcap
-    # Inventario inmóvil del ejercicio: cuentas de inventario (115-129) cuyo saldo no se movió desde la apertura.
-    # Genérico y transferible: detecta el congelado de cualquier cliente sin cablear cuentas por cliente.
-    inv_inmovil = sum(x['sf'] for x in acc if '115' <= x['g'] <= '129' and abs(x['sf'] - _yst(x)) < 1)
+    # Inventario inmóvil del ejercicio: agrupador de inventario (115-129) cuya posición no se movió desde la apertura.
+    inv_inmovil = sum(v for ag,v in cierre_sig.items() if '115' <= ag[:3] <= '129' and abs(_yd(ag)) < 1)
     cash = dict(uai=ytd['uai'], dep=ytd['dep'], capex=capex, opcap=opcap, opcap_ini=opcap_ini,
                 dopcap=dopcap, generador=generador, isr_prov=isr_prov, un=ytd['un'], inv_inmovil=inv_inmovil)
     return dict(er=er, bg=bg, efe=efe, ytd=ytd, cash=cash)
@@ -984,6 +1029,10 @@ else:
                 st.warning("No hay un mes anterior cargado para comparar. Mostrando solo el mes seleccionado.")
                 comparar = False
             ca = mes_ef[:7]
+            ok_efe, causa_efe, acc_efe = _efe_diag(ef_a["efe"])
+            if not ok_efe:
+                st.error("ESTADOS RETENIDOS (R-EFE-01) - " + causa_efe + "  **Accion:** " + acc_efe +
+                         "  Los estados de abajo son diagnostico interno, no entregables al cliente.")
             if comparar:
                 cp = per_p
                 st.markdown("#### Estado de Resultados · " + ca + " vs " + cp + " (acumulado)")
@@ -1083,3 +1132,4 @@ else:
                 vp = pmap.get((s,l),(None,f))[0]
                 tabla.append("| " + l + " | " + _fr(v,f) + " | " + _fr(vp,f) + " | " + _fvar(v,vp,f) + " |")
             if tabla: st.markdown("\n".join(tabla))
+ 
