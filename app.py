@@ -786,6 +786,60 @@ def licitacion_eval(ef, propuesta):
                 ac_pc=ac_pc, at_pt=at_pt, pt_at=pt_at, a=a, b=b, c=c,
                 elegible=elegible, propuesta=propuesta)
  
+# Anclas duras (Crabtree) cableadas como default; meta_indicador las sobrescribe por cliente. R-SU-16.
+DEFAULT_METAS = {
+    'pretax_pct': dict(tipo='umbral', direccion='mayor_mejor', valor_meta=10.0, fuente='crabtree',
+                       nota='Pre-Tax >=10% (Crabtree, piso).'),
+    'gpld':       dict(tipo='umbral', direccion='mayor_mejor', valor_meta=1.35, fuente='crabtree',
+                       nota='GPLD >=1.35 (Crabtree).'),
+    'cash_lag':   dict(tipo='umbral', direccion='menor_mejor', valor_meta=0.0,  fuente='crabtree',
+                       nota='Cash Lag <=0: la utilidad llega a caja.'),
+}
+ 
+def meta_de(indicador, metas):
+    """Meta sembrada por cliente (meta_indicador) tiene prioridad sobre el default cableado."""
+    return metas.get(indicador) or DEFAULT_METAS.get(indicador)
+ 
+def evaluar_meta(valor, m):
+    """Devuelve (brecha_firmada, estado). Brecha negativa = falta para llegar a la meta. R-MET-02."""
+    if valor is None or not m or m.get('valor_meta') is None:
+        return None, None
+    meta = m['valor_meta']; dirn = m.get('direccion', 'mayor_mejor')
+    signo = -1 if dirn == 'menor_mejor' else 1
+    brecha = (valor - meta) * signo
+    if dirn == 'contextual':
+        return brecha, 'contextual'
+    return brecha, ('cumple' if brecha >= 0 else 'falta')
+ 
+def _fmeta(v, fmt):
+    if v is None: return "—"
+    if fmt == 'pctnum': return "{:.1f}%".format(v)
+    if fmt == 'x':      return "{:.2f}x".format(v)
+    if fmt == 'pesos':  return _fmt(v)
+    return "{:.2f}".format(v)
+ 
+def _fmeta_brecha(v, fmt):
+    if v is None: return "—"
+    if fmt == 'pctnum': return "{:+.1f} pp".format(v)
+    if fmt == 'x':      return "{:+.2f}x".format(v)
+    if fmt == 'pesos':  return _fmt(v)
+    return "{:+.2f}".format(v)
+ 
+def tabla_avance_meta(items, metas):
+    """items = [(label, indicador_key, valor, fmt)]. Tabla markdown Actual/Meta/Brecha/Estado, o None si nada tiene meta."""
+    rows = ["| Indicador | Actual | Meta | Brecha | Estado |", "|---|--:|--:|--:|:--|"]
+    edo_txt = {'cumple': 'Cumple', 'falta': 'Falta', 'contextual': 'Contextual'}
+    hay = False
+    for label, key, valor, fmt in items:
+        m = meta_de(key, metas)
+        if not m or m.get('valor_meta') is None:
+            continue
+        hay = True
+        brecha, estado = evaluar_meta(valor, m)
+        rows.append("| " + label + " | " + _fmeta(valor, fmt) + " | " + _fmeta(m['valor_meta'], fmt) +
+                    " | " + _fmeta_brecha(brecha, fmt) + " | " + edo_txt.get(estado, "—") + " |")
+    return "\n".join(rows) if hay else None
+ 
 def ratios_mensuales(cli, periodo):
     import datetime
     sd = lambda a,b: (a/b) if b else None
@@ -949,6 +1003,20 @@ if st.button("Cargar y validar", type="primary", disabled=not (subidos and 'BALA
     a2.metric("Nómina / Ingresos", f"{ind['nomina_pct']}%" if ind['nomina_pct'] is not None else "—")
     a3.metric("GPLD", f"{ind['gpld']}x" if ind['gpld'] is not None else "n/a")
     a4.metric("Caja fin de mes", money(ind['caja']))
+ 
+    # ---- Avance contra meta (Actual · Meta · Brecha · Estado) ----
+    st.subheader("Avance contra meta")
+    _metas_b = get_metas(cli_id, int(per[:4]))
+    _items_b = [("Pre-Tax Profit %", "pretax_pct", ind["pretax_pct"], "pctnum"),
+                ("GPLD",             "gpld",       ind["gpld"],       "x"),
+                ("Cash Lag",         "cash_lag",   ind["cash_lag"],   "pesos")]
+    _tab_b = tabla_avance_meta(_items_b, _metas_b)
+    if _tab_b:
+        st.markdown(_tab_b)
+        st.caption("Brecha firmada: negativa = falta para llegar a la meta (R-MET-02). "
+                   "Anclas duras Pre-Tax 10% y GPLD 1.35 (Crabtree); se sobrescriben por cliente desde meta_indicador.")
+    else:
+        st.caption("Sin metas definidas para este cliente/ejercicio.")
  
     # ---- P&L de Gestión ----
     with st.expander("P&L de Gestión (no constituye estado de resultados NIF)"):
@@ -1252,4 +1320,3 @@ else:
             st.caption("Brecha firmada: negativa = falta para llegar a la meta (R-MET-02). "
                        "Diagnóstico sobre la posición del mes; para clientes en recontabilización (Fase 0) "
                        "las razones del balance no son certificables hasta cerrar (R-MET-06).")
- 
