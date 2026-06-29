@@ -1771,6 +1771,57 @@ if st.button("Cargar y validar", type="primary", disabled=not (subidos and 'BALA
 
 
 # ---------------------------------------------------------------------------
+# 1 - CAPTURA MANUAL (onboarding + mensual). Lo que el sistema no puede calcular.
+# ---------------------------------------------------------------------------
+st.divider()
+st.markdown("### 1 · Captura manual")
+st.caption("Llena esto primero. Solo lo que no vive en la contabilidad; el resto lo lee el sistema del agrupador. "
+           "Los datos del cliente (Constancia) se capturan arriba, al elegir el cliente.")
+
+with st.expander("Metas del ejercicio (onboarding) — propuesta de licitación", expanded=False):
+    _pmeta = periodos_cargados(cli_id)
+    _ej0 = int(_pmeta[0][:4]) if _pmeta else 2026
+    _ejm = st.number_input("Ejercicio", value=_ej0, step=1, format="%d", key="meta_ej")
+    _metas_cur = get_metas(cli_id, int(_ejm))
+    _prow = _metas_cur.get("licit_propuesta")
+    _prv = _prow["valor_meta"] if _prow else 0.0
+    st.caption("Un solo dato fija la meta de licitación del ejercicio: el CNT meta = 20% de la propuesta (sin IVA).")
+    _nv = st.number_input("Propuesta objetivo del ejercicio (sin IVA, MXN)",
+                          min_value=0.0, value=float(_prv), step=1_000_000.0, format="%.0f", key="meta_prop")
+    if st.button("Guardar meta del ejercicio", key="meta_save"):
+        set_meta(cli_id, int(_ejm), "licit_propuesta", _nv, tipo="umbral", direccion="mayor_mejor",
+                 fuente="licitacion", nota="Propuesta objetivo sin IVA; CNT meta = 20% de este valor.")
+        st.success("Meta guardada para el ejercicio " + str(int(_ejm)) + ".")
+
+with st.expander("Captura fiscal del mes (Controles 3 y 4)", expanded=False):
+    _pcf = periodos_cargados(cli_id)
+    if not _pcf:
+        st.caption("Carga al menos un mes para capturar la parte fiscal mensual.")
+    else:
+        _mcf = st.selectbox("Mes", _pcf, key="capfis_mes")
+        _capf = get_captura_fiscal(cli_id, _mcf)
+        st.caption("Utilidad fiscal estimada y coeficiente (C3); bandera de devolución de IVA (C4).")
+        _cca, _ccb = st.columns(2)
+        with _cca:
+            _ufe = st.number_input("Utilidad fiscal estimada del ejercicio (acumulada, C3)",
+                                   value=float(_capf.get("util_fiscal_estimada") or 0.0), step=10000.0, key="capfis_ufe")
+            _coef = st.number_input("Coeficiente de utilidad (informativo, C3)",
+                                    value=float(_capf.get("coef_utilidad") or 0.0), step=0.01, format="%.4f", key="capfis_coef")
+        with _ccb:
+            _tram = st.checkbox("Devolución/compensación de IVA en trámite (C4)",
+                                value=bool(_capf.get("iva_devolucion_tramite")), key="capfis_tram")
+        if st.button("Guardar captura fiscal", key="capfis_save"):
+            try:
+                save_captura_fiscal(cli_id, _mcf, {
+                    "util_fiscal_estimada": _ufe if _ufe else None,
+                    "coef_utilidad": _coef if _coef else None,
+                    "iva_devolucion_tramite": 1 if _tram else 0})
+                st.success("Captura fiscal guardada.")
+            except Exception as e:
+                st.error("No se pudo guardar (¿corriste captura_fiscal.sql en Supabase?). " + repr(e))
+
+
+# ---------------------------------------------------------------------------
 # COMPARATIVO DE MESES CARGADOS
 # ---------------------------------------------------------------------------
 st.divider()
@@ -2037,27 +2088,6 @@ if not _pfis:
     st.caption("Carga al menos un mes.")
 else:
     mes_fis = st.selectbox("Mes", _pfis, key="fis_mes")
-    _capf = get_captura_fiscal(cli_id, mes_fis)
-    with st.expander("Captura fiscal del mes (C3 y C4)"):
-        st.caption("Solo lo que no vive en la contabilidad. Lo demás lo lee el sistema del agrupador.")
-        cfa, cfb = st.columns(2)
-        with cfa:
-            _ufe = st.number_input("Utilidad fiscal estimada del ejercicio (acumulada, C3)",
-                                   value=float(_capf.get("util_fiscal_estimada") or 0.0), step=10000.0, key="fis_ufe")
-            _coef = st.number_input("Coeficiente de utilidad (informativo, C3)",
-                                    value=float(_capf.get("coef_utilidad") or 0.0), step=0.01, format="%.4f", key="fis_coef")
-        with cfb:
-            _tram = st.checkbox("Devolución/compensación de IVA en trámite (C4)",
-                                value=bool(_capf.get("iva_devolucion_tramite")), key="fis_tram")
-        if st.button("Guardar captura fiscal", key="fis_save"):
-            try:
-                save_captura_fiscal(cli_id, mes_fis, {
-                    "util_fiscal_estimada": _ufe if _ufe else None,
-                    "coef_utilidad": _coef if _coef else None,
-                    "iva_devolucion_tramite": 1 if _tram else 0})
-                st.success("Captura fiscal guardada.")
-            except Exception as e:
-                st.error("No se pudo guardar (¿corriste captura_fiscal.sql en Supabase?). " + repr(e))
     if st.button("Evaluar sección fiscal", key="fis_eval"):
         _sem = evaluar_fiscal(cli_id, mes_fis)
         if not _sem:
@@ -2128,19 +2158,8 @@ else:
     metas = get_metas(cli_id, ejercicio)
     prop_row = metas.get("licit_propuesta")
     propuesta = prop_row["valor_meta"] if prop_row else None
-    with st.expander("Meta del ejercicio (onboarding) — ¿a cuánto de obra quieres concursar?",
-                     expanded=(propuesta is None)):
-        st.caption("Un solo dato fija toda la meta de licitación del ejercicio: el CNT meta = 20% de la propuesta.")
-        nueva = st.number_input("Propuesta objetivo del ejercicio " + str(ejercicio) + " (sin IVA, MXN)",
-                                min_value=0.0, value=float(propuesta) if propuesta else 0.0,
-                                step=1_000_000.0, format="%.0f", key="lic_prop")
-        if st.button("Guardar meta del ejercicio", key="lic_save"):
-            set_meta(cli_id, ejercicio, "licit_propuesta", nueva, tipo="umbral", direccion="mayor_mejor",
-                     fuente="licitacion", nota="Propuesta objetivo sin IVA; CNT meta = 20% de este valor.")
-            st.success("Meta guardada para el ejercicio " + str(ejercicio) + ". Vuelve a generar para ver la evaluación.")
-            propuesta = nueva
     if not propuesta:
-        st.info("Define la propuesta objetivo del ejercicio para evaluar elegibilidad.")
+        st.info("Define la propuesta objetivo del ejercicio en la sección de captura (Metas del ejercicio) para evaluar elegibilidad.")
     else:
         _resl = comparativo_estados(cli_id, mes_lic)
         if not _resl or _resl[0] is None:
