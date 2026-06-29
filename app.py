@@ -1025,6 +1025,139 @@ def _fiscal_buckets(acc, saldo_g):
                 isr_prov=saldo_g.get('114', 0.0),
                 hay_multas_recargos=(abs(recargos) >= 1 or abs(multas) >= 1))
 
+FISCAL_CAMPOS = ["util_fiscal_estimada", "coef_utilidad", "iva_devolucion_tramite"]
+
+def get_captura_fiscal(cli, periodo):
+    """Lee la captura fiscal manual de un cliente/periodo. Devuelve dict clave->valor."""
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT clave, valor FROM captura_fiscal WHERE cliente_id=%s AND periodo=%s", (cli, periodo))
+        return {c: (float(v) if v is not None else None) for c, v in cur.fetchall()}
+    except Exception:
+        return {}
+    finally:
+        cur.close(); conn.close()
+
+def save_captura_fiscal(cli, periodo, data):
+    """Upsert de la captura fiscal manual. data: dict clave->valor (None se omite)."""
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        for k, v in data.items():
+            if v is None or v == "":
+                continue
+            cur.execute("""INSERT INTO captura_fiscal (cliente_id,periodo,clave,valor,actualizado)
+                           VALUES (%s,%s,%s,%s,now())
+                           ON CONFLICT (cliente_id,periodo,clave)
+                           DO UPDATE SET valor=EXCLUDED.valor, actualizado=now()""",
+                        (cli, periodo, k, float(v)))
+        conn.commit()
+    finally:
+        cur.close(); conn.close()
+
+def _meses_iva_favor(cli, periodo, n=3):
+    """Cuenta meses consecutivos (hacia atrás desde periodo) con IVA neto a favor. Requiere serie. R-FIS-06."""
+    import datetime as _dt
+    y, m = int(str(periodo)[:4]), int(str(periodo)[5:7])
+    cont = 0
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        for _ in range(n):
+            per = _dt.date(y, m, 1)
+            try:
+                cur.execute("SELECT valor FROM fn_eiva(%s,%s) WHERE concepto=%s",
+                            (cli, per, 'IVA neto (+cargo / -favor)'))
+                r = cur.fetchone()
+            except Exception:
+                r = None
+            if r and r[0] is not None and float(r[0]) < 0:
+                cont += 1
+            else:
+                break
+            m -= 1
+            if m == 0:
+                m = 12; y -= 1
+    finally:
+        cur.close(); conn.close()
+    return cont
+
+def _sem_c2(fis):
+    """Control 2 — no deducible. Automático desde contabilidad. R-FIS-08."""
+    gt = fis["gas_total"] or 0
+    perm = fis["nd_permanente"]; pp = (perm / gt * 100) if gt else 0
+    if fis["hay_multas_recargos"]:
+        return ("rojo", "C2 · No deducible", money(perm),
+                "Multas/recargos contabilizados: no deducible permanente y falla de cumplimiento.",
+                "Diagnóstico de causa raíz + Programa Cero Recargos")
+    if pp > 3:
+        return ("amarillo", "C2 · No deducible", "{:.1f}%".format(pp),
+                "No deducible permanente > 3% del gasto.", "Blindaje de Deducciones")
+    if (fis["nd_sinreq"] or 0) > 0:
+        return ("amarillo", "C2 · No deducible", money(fis["nd_sinreq"]),
+                "Hay no deducible sin requisitos identificado.", "Blindaje de Deducciones")
+    return ("verde", "C2 · No deducible", "{:.1f}%".format(pp), "Sin multas/recargos en el periodo.", None)
+
+def _sem_c3(isr_prov, util_fiscal_est):
+    """Control 3 — tasa efectiva ISR. Compuerta de pérdida. R-FIS-05."""
+    if util_fiscal_est is None:
+        return ("gris", "C3 · Tasa efectiva ISR", "s/d", "Falta capturar la utilidad fiscal estimada.", "Captura fiscal")
+    if util_fiscal_est <= 0:
+        return ("neutral", "C3 · Tasa efectiva ISR", "no aplica",
+                "Utilidad fiscal proyectada <= 0: no hay ISR que optimizar.", None)
+    isr_proy = util_fiscal_est * 0.30
+    bp = ((isr_prov or 0) - isr_proy) / isr_proy * 100 if isr_proy else 0
+    if abs(bp) <= 10:
+        return ("verde", "C3 · Tasa efectiva ISR", "{:+.0f}%".format(bp),
+                "Pagos provisionales alineados al ISR proyectado.", None)
+    if abs(bp) <= 25:
+        lbl = "sobre-pago" if bp > 0 else "sub-provisión"
+        return ("amarillo", "C3 · Tasa efectiva ISR", "{:+.0f}%".format(bp),
+                "Brecha de " + lbl + " moderada.", "Revisar pagos provisionales")
+    if bp > 25:
+        return ("rojo", "C3 · Tasa efectiva ISR", "{:+.0f}%".format(bp),
+                "Sobre-pago material: caja atrapada en el SAT.", "Optimización de pagos provisionales (reducción)")
+    return ("rojo", "C3 · Tasa efectiva ISR", "{:+.0f}%".format(bp),
+            "Sub-provisión material: shock fiscal + recargos 2.07% en puerta.", "Ajuste de provisión inmediato")
+
+def _sem_c4(iva_neto, meses_favor, flag_tramite):
+    """Control 4 — IVA a favor / caja atrapada. R-FIS-09."""
+    a_favor = (iva_neto is not None and iva_neto < 0)
+    mag = money(abs(iva_neto)) if iva_neto is not None else "s/d"
+    if not a_favor or flag_tramite:
+        return ("verde", "C4 · IVA a favor", mag, "Sin saldo a favor, o devolución en trámite.", None)
+    if meses_favor >= 3:
+        return ("rojo", "C4 · IVA a favor", mag,
+                "Saldo a favor " + str(meses_favor) + " meses sin trámite: caja atrapada.",
+                "Recuperación de IVA (devolución, LIVA art. 6)")
+    return ("amarillo", "C4 · IVA a favor", mag, "Saldo a favor reciente sin acción.", "Recuperación de IVA")
+
+def evaluar_fiscal(cli, periodo):
+    """Evalúa la sección fiscal (C2 auto, C3/C4 con captura). Devuelve lista de semáforos. C1 en stand-by."""
+    res = comparativo_estados(cli, periodo)
+    if not res:
+        return None
+    ef = res[0]; fis = ef["fiscal"]
+    cap = get_captura_fiscal(cli, periodo)
+    # C4: IVA neto del periodo
+    iva_neto = None
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT valor FROM fn_eiva(%s,%s) WHERE concepto=%s",
+                    (cli, periodo, 'IVA neto (+cargo / -favor)'))
+        r = cur.fetchone()
+        if r and r[0] is not None:
+            iva_neto = float(r[0])
+    except Exception:
+        iva_neto = None
+    finally:
+        cur.close(); conn.close()
+    meses_favor = _meses_iva_favor(cli, periodo) if (iva_neto is not None and iva_neto < 0) else 0
+    flag = bool(cap.get("iva_devolucion_tramite"))
+    return [
+        _sem_c2(fis),
+        _sem_c3(fis["isr_prov"], cap.get("util_fiscal_estimada")),
+        _sem_c4(iva_neto, meses_favor, flag),
+    ]
+
 def estados_financieros(archivo_id):
     """ER (NIF) + Balance General + EFE (indirecto) por partida. Lógica validada en datos reales."""
     from collections import defaultdict
@@ -1893,44 +2026,58 @@ else:
 
 
 # ---------------------------------------------------------------------------
-# CAPA FISCAL - IDENTIFICACION DEL NO DEDUCIBLE (desde contabilidad)
+# SECCION FISCAL - SEMAFOROS (C2 auto, C3/C4 con captura). C1 stand-by.
 # ---------------------------------------------------------------------------
 st.divider()
-st.subheader("Capa fiscal — no deducible (identificado desde contabilidad)")
-st.caption("Lectura automática por subcódigo agrupador SAT. No clasifica recuperable vs. perdido (eso es captura fiscal posterior); "
-           "solo identifica lo que la contabilidad ya separa. Base YTD del ejercicio.")
+st.subheader("Sección fiscal — semáforos")
+st.caption("Tablero delgado: tres semáforos, no indicadores nuevos. C2 (no deducible) sale solo de contabilidad; "
+           "C3 y C4 usan captura manual. C1 (69-B/EFOS) en stand-by. Base YTD.")
 _pfis = periodos_cargados(cli_id)
 if not _pfis:
     st.caption("Carga al menos un mes.")
 else:
     mes_fis = st.selectbox("Mes", _pfis, key="fis_mes")
-    if st.button("Identificar no deducible", key="fis_btn"):
-        _rf = comparativo_estados(cli_id, mes_fis)
-        if not _rf:
+    _capf = get_captura_fiscal(cli_id, mes_fis)
+    with st.expander("Captura fiscal del mes (C3 y C4)"):
+        st.caption("Solo lo que no vive en la contabilidad. Lo demás lo lee el sistema del agrupador.")
+        cfa, cfb = st.columns(2)
+        with cfa:
+            _ufe = st.number_input("Utilidad fiscal estimada del ejercicio (acumulada, C3)",
+                                   value=float(_capf.get("util_fiscal_estimada") or 0.0), step=10000.0, key="fis_ufe")
+            _coef = st.number_input("Coeficiente de utilidad (informativo, C3)",
+                                    value=float(_capf.get("coef_utilidad") or 0.0), step=0.01, format="%.4f", key="fis_coef")
+        with cfb:
+            _tram = st.checkbox("Devolución/compensación de IVA en trámite (C4)",
+                                value=bool(_capf.get("iva_devolucion_tramite")), key="fis_tram")
+        if st.button("Guardar captura fiscal", key="fis_save"):
+            try:
+                save_captura_fiscal(cli_id, mes_fis, {
+                    "util_fiscal_estimada": _ufe if _ufe else None,
+                    "coef_utilidad": _coef if _coef else None,
+                    "iva_devolucion_tramite": 1 if _tram else 0})
+                st.success("Captura fiscal guardada.")
+            except Exception as e:
+                st.error("No se pudo guardar (¿corriste captura_fiscal.sql en Supabase?). " + repr(e))
+    if st.button("Evaluar sección fiscal", key="fis_eval"):
+        _sem = evaluar_fiscal(cli_id, mes_fis)
+        if not _sem:
             st.error("No se encontró la balanza de ese mes.")
         else:
-            _eff = _rf[0]["fiscal"]
-            _gt = _eff["gas_total"] or 0
-            _pp = (_eff["nd_permanente"] / _gt * 100) if _gt else 0
-            _ps = (_eff["nd_sinreq"] / _gt * 100) if _gt else 0
-            f1, f2, f3 = st.columns(3)
-            f1.metric("No deducible permanente", money(_eff["nd_permanente"]),
-                      delta=f"{_pp:.1f}% del gasto", delta_color="off")
-            f1.caption("Recargos " + money(_eff["nd_recargos"]) + " + multas/sanciones " + money(_eff["nd_multas"]))
-            f2.metric("No deducible sin requisitos", money(_eff["nd_sinreq"]),
-                      delta=f"{_ps:.1f}% del gasto", delta_color="off")
-            f2.caption("Identificado; recuperable o perdido se define en captura fiscal.")
-            f3.metric("ISR provisional pagado (YTD)", money(_eff["isr_prov"]))
-            f3.caption("No deducible CUFIN: " + money(_eff["nd_cufin"]))
-            if _eff["hay_multas_recargos"]:
-                st.error("🔴 Control 2 (R-FIS-08): hay multas/recargos contabilizados (" +
-                         money(_eff["nd_permanente"]) + "). Es no deducible permanente y señal de falla de cumplimiento. "
-                         "Acción facturable: diagnóstico de causa raíz + Programa Cero Recargos.")
-            elif _pp > 3:
-                st.warning("🟡 No deducible permanente > 3% del gasto. Revisar.")
-            else:
-                st.success("🟢 Sin multas/recargos contabilizados en el periodo.")
-            st.caption("Para CKT, la etiqueta contable del ISN aún dice '3%'; la ley NL 2026 es 4%. Recosteo de obra pendiente.")
+            _ico = {"verde": "🟢", "amarillo": "🟡", "rojo": "🔴", "neutral": "⚪", "gris": "⚪"}
+            for luz, titulo, valor, msg, accion in _sem:
+                _box = {"rojo": st.error, "amarillo": st.warning, "verde": st.success}.get(luz, st.info)
+                _txt = _ico.get(luz, "⚪") + " **" + titulo + "** — " + valor + "  \n" + msg
+                if accion:
+                    _txt += "  \n**Acción facturable:** " + accion
+                _box(_txt)
+            # detalle de C2 desde contabilidad
+            _eff = comparativo_estados(cli_id, mes_fis)[0]["fiscal"]
+            st.caption("Detalle C2 (contabilidad): recargos " + money(_eff["nd_recargos"]) +
+                       " · multas/sanciones " + money(_eff["nd_multas"]) +
+                       " · sin requisitos " + money(_eff["nd_sinreq"]) +
+                       " · CUFIN " + money(_eff["nd_cufin"]) +
+                       " · ISR provisional pagado " + money(_eff["isr_prov"]))
+            st.caption("Nota: la cuenta de ISN de CKT aún se etiqueta '3%'; la ley NL 2026 es 4%. Recosteo de obra pendiente.")
 
 
 # ---------------------------------------------------------------------------
