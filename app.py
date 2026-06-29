@@ -434,6 +434,49 @@ def save_cliente_csf(cli, data):
     finally:
         cur.close(); conn.close()
 
+def _hex_rgb(h, default=(28, 45, 58)):
+    try:
+        h = (h or "").lstrip("#")
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    except Exception:
+        return default
+
+def get_branding(cli):
+    """Identidad visual del cliente: color_primario, color_acento, logo (bytes), logo_nombre."""
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT color_primario, color_acento, logo, logo_nombre FROM cliente_branding WHERE cliente_id=%s", (cli,))
+        r = cur.fetchone()
+        if not r:
+            return None
+        return dict(color_primario=r[0], color_acento=r[1],
+                    logo=(bytes(r[2]) if r[2] is not None else None), logo_nombre=r[3])
+    except Exception:
+        return None
+    finally:
+        cur.close(); conn.close()
+
+def save_branding(cli, color_primario, color_acento, logo_bytes=None, logo_nombre=None):
+    """Upsert de identidad visual. Si logo_bytes es None, conserva el logo existente (solo actualiza colores)."""
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        if logo_bytes is not None:
+            cur.execute("""INSERT INTO cliente_branding (cliente_id,color_primario,color_acento,logo,logo_nombre,actualizado)
+                           VALUES (%s,%s,%s,%s,%s,now())
+                           ON CONFLICT (cliente_id) DO UPDATE SET color_primario=EXCLUDED.color_primario,
+                             color_acento=EXCLUDED.color_acento, logo=EXCLUDED.logo,
+                             logo_nombre=EXCLUDED.logo_nombre, actualizado=now()""",
+                        (cli, color_primario, color_acento, psycopg2.Binary(logo_bytes), logo_nombre))
+        else:
+            cur.execute("""INSERT INTO cliente_branding (cliente_id,color_primario,color_acento,actualizado)
+                           VALUES (%s,%s,%s,now())
+                           ON CONFLICT (cliente_id) DO UPDATE SET color_primario=EXCLUDED.color_primario,
+                             color_acento=EXCLUDED.color_acento, actualizado=now()""",
+                        (cli, color_primario, color_acento))
+        conn.commit()
+    finally:
+        cur.close(); conn.close()
+
 def _pdf_tabla_estado(pdf, t, Mg, CW, titulo, rows, ca, cp):
     dual = cp is not None
     if pdf.get_y() + 18 > 282: pdf.add_page()
@@ -1775,6 +1818,26 @@ with st.expander("Metas del ejercicio (onboarding) — propuesta de licitación"
         set_meta(cli_id, int(_ejm), "isn_tasa", _isn, tipo="parametro", direccion="contextual",
                  fuente="ley_hacienda_estatal", nota="Tasa ISN del estado del cliente; se siembra en onboarding.")
         st.success("Meta y tasa ISN guardadas para el ejercicio " + str(int(_ejm)) + ".")
+
+with st.expander("Identidad visual del cliente (logo y colores)", expanded=False):
+    _brand = get_branding(cli_id) or {}
+    st.caption("Viste el reporte del cliente. El semáforo (rojo/amarillo/verde) no se tiñe: es universal y no se toca.")
+    _bc1, _bc2 = st.columns(2)
+    with _bc1:
+        _cprim = st.color_picker("Color primario (títulos)", value=_brand.get("color_primario") or "#1C2D3A", key="brand_prim")
+    with _bc2:
+        _cacc = st.color_picker("Color de acento (línea/detalles)", value=_brand.get("color_acento") or "#2E86AB", key="brand_acc")
+    _logo_up = st.file_uploader("Logo del cliente (PNG o JPG, preferente fondo claro)", type=["png", "jpg", "jpeg"], key="brand_logo")
+    if _brand.get("logo"):
+        st.caption("Logo actual: " + (_brand.get("logo_nombre") or "guardado") + ". Sube uno nuevo solo si quieres reemplazarlo.")
+    if st.button("Guardar identidad visual", key="brand_save"):
+        try:
+            _lb = _logo_up.getvalue() if _logo_up is not None else None
+            _ln = _logo_up.name if _logo_up is not None else None
+            save_branding(cli_id, _cprim, _cacc, _lb, _ln)
+            st.success("Identidad visual guardada.")
+        except Exception as e:
+            st.error("No se pudo guardar (¿corriste cliente_branding.sql en Supabase?). " + repr(e))
 
 with st.expander("Captura fiscal del mes (Controles 3 y 4)", expanded=False):
     _pcf = periodos_cargados(cli_id)
