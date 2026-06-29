@@ -309,6 +309,43 @@ def cierre_ejercicio(cli, anio):
     finally:
         cur.close(); conn.close()
 
+def _dias_mes(periodo):
+    import datetime as _dt
+    y, m = int(periodo[:4]), int(periodo[5:7])
+    return (_dt.date(y,12,31) if m==12 else _dt.date(y,m+1,1)-_dt.timedelta(days=1)).day
+
+def base_poder_uno(ef, ef_prev, periodo, temporalidad):
+    """Base de ingresos/costo/gastos y stocks para el Poder del Uno, segun la temporalidad elegida."""
+    ytd = ef["ytd"]; s = _stocks_de(ef); dy = _dias_ytd(periodo)
+    if temporalidad == "mensual":
+        p = ef_prev["ytd"] if ef_prev else {}
+        ing = ytd["ing"]-p.get("ing",0); cos = ytd["cos"]-p.get("cos",0); gas = ytd["gas"]-p.get("gas",0)
+        dias = _dias_mes(periodo)
+    elif temporalidad == "anualizado":
+        f = 365/dy if dy else 1
+        ing = ytd["ing"]*f; cos = ytd["cos"]*f; gas = ytd["gas"]*f; dias = 365
+    else:  # ytd
+        ing = ytd["ing"]; cos = ytd["cos"]; gas = ytd["gas"]; dias = dy
+    return dict(ing=ing, cos=cos, gas=gas, cxc=s["cxc"], inv=s["inv"], cxp=s["cxp"], dias=dias)
+
+def poder_uno_tabla(base, mv):
+    """Impacto en pesos de cada palanca al movimiento capturado. mv: precio/volumen/costo/gastos (%) y cxc/inv/cxp (dias).
+    Devuelve (filas, delta_utilidad, delta_caja, trampa_volumen, utilidad_bruta)."""
+    ing, cos, gas, dias = base["ing"], base["cos"], base["gas"], base["dias"]
+    ub = ing - cos; rev = ing/dias if dias else 0; cd = cos/dias if dias else 0
+    filas = [
+        ("Precio",              "+{:.1f}%".format(mv["precio"]),  ing*mv["precio"]/100,  "utilidad"),
+        ("Volumen",             "+{:.1f}%".format(mv["volumen"]), ub*mv["volumen"]/100,  "utilidad"),
+        ("Costo de ventas",     "-{:.1f}%".format(mv["costo"]),   cos*mv["costo"]/100,   "utilidad"),
+        ("Gastos de operacion", "-{:.1f}%".format(mv["gastos"]),  gas*mv["gastos"]/100,  "utilidad"),
+        ("Dias por cobrar",     "-{:.0f} dias".format(mv["cxc"]), rev*mv["cxc"],         "caja"),
+        ("Dias de inventario",  "-{:.0f} dias".format(mv["inv"]), cd*mv["inv"],          "caja"),
+        ("Dias por pagar",      "+{:.0f} dias".format(mv["cxp"]), cd*mv["cxp"],          "caja"),
+    ]
+    du = sum(v for _,_,v,k in filas if k=="utilidad")
+    dc = sum(v for _,_,v,k in filas if k=="caja")
+    return filas, du, dc, (ub < 0 and mv["volumen"] > 0), ub
+
 def modelo_negocio(ef, dias):
     """Tabla 3.10 de Alexander con los indicadores que el sistema ya calcula (cierre del ejercicio)."""
     y = ef["ytd"]; s = _stocks_de(ef); ing = y["ing"]
@@ -634,7 +671,7 @@ def _metas_cliente_rows(ind, metas):
     return rows
 
 def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per_p=None, rat=None,
-                        numero_mes=None, acciones=None, valor_generado=None, metas=None):
+                        numero_mes=None, acciones=None, valor_generado=None, metas=None, poder_uno=None):
     """Reporte CFO mensual del cliente. Base YTD (acumulado). Caja al centro (regla de hierro)."""
     from fpdf import FPDF
     class _PDFCli(FPDF):
@@ -746,6 +783,44 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
         elif ok:       pdf.set_text_color(39, 174, 96)
         else:          pdf.set_text_color(192, 57, 43)
         pdf.cell(CW - 146, 6, t(edo), align="R"); pdf.ln(6)
+
+    # ===================== HOJA: las palancas (Poder del Uno) =====================
+    if poder_uno:
+        pu = poder_uno
+        _tlbl = {"mensual": "del mes", "ytd": "acumulado del ano", "anualizado": "anualizado"}.get(pu.get("temporalidad"), "")
+        def _sgn(v):
+            return ("+" if v >= 0 else "-") + money(abs(v))
+        pdf.add_page()
+        pdf.set_fill_color(28, 45, 58); pdf.rect(0, 0, W, 22, style="F")
+        pdf.set_text_color(255, 255, 255); pdf.set_xy(Mg, 6); pdf.set_font("Helvetica", "B", 15); pdf.cell(CW, 8, t("Las palancas de tu negocio"))
+        pdf.set_y(28)
+        pdf.set_x(Mg); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 9)
+        pdf.multi_cell(CW, 4.5, t("Cuanto cambia tu utilidad o tu caja si mueves cada palanca (base: " + _tlbl + ")."))
+        pdf.ln(3)
+        pdf.set_x(Mg); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "B", 8)
+        pdf.cell(72, 6, t("Palanca")); pdf.cell(34, 6, t("Movimiento"), align="R"); pdf.cell(42, 6, t("Efecto"), align="R"); pdf.cell(CW - 148, 6, t("Sobre"), align="R"); pdf.ln(6)
+        for nom, mov, imp, k in pu["filas"]:
+            pdf.set_x(Mg); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "", 9)
+            pdf.cell(72, 6, t(nom)); pdf.cell(34, 6, t(mov), align="R")
+            if imp > 0: pdf.set_text_color(39, 174, 96)
+            elif imp < 0: pdf.set_text_color(192, 57, 43)
+            else: pdf.set_text_color(127, 140, 141)
+            pdf.cell(42, 6, t(_sgn(imp)), align="R")
+            pdf.set_text_color(127, 140, 141); pdf.cell(CW - 148, 6, t(k), align="R"); pdf.ln(6)
+        pdf.ln(3)
+        if pu.get("trampa"):
+            yb = pdf.get_y(); pdf.set_fill_color(253, 235, 233); pdf.set_draw_color(192, 57, 43); pdf.rect(Mg, yb, CW, 15, style="DF")
+            pdf.set_xy(Mg + 3, yb + 2.5); pdf.set_text_color(192, 57, 43); pdf.set_font("Helvetica", "B", 9)
+            pdf.multi_cell(CW - 6, 4.5, t("Cuidado: con tu margen actual, vender mas volumen REDUCE la utilidad. "
+                                          "Primero se arregla el margen, despues se busca vender mas."))
+            pdf.set_y(yb + 18)
+        pdf.set_x(Mg); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B", 11); pdf.cell(CW, 7, t("Si mueves todas las palancas juntas:")); pdf.ln(9)
+        for _lbl, _v in [("Cambio en tu utilidad", pu.get("du", 0)), ("Cambio en tu caja", pu.get("dc", 0))]:
+            pdf.set_x(Mg); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "", 10.5); pdf.cell(72, 8, t(_lbl))
+            if _v > 0: pdf.set_text_color(39, 174, 96)
+            elif _v < 0: pdf.set_text_color(192, 57, 43)
+            else: pdf.set_text_color(127, 140, 141)
+            pdf.set_font("Helvetica", "B", 13); pdf.cell(CW - 72, 8, t(_sgn(_v))); pdf.ln(9)
 
     # ===================== HOJA 3: valor generado =====================
     pdf.add_page()
@@ -1639,18 +1714,69 @@ else:
                     _ef_a, _ef_p, _per_p = _res_ef if _res_ef else (None, None, None)
                     _rat = ratios_mensuales(cli_id, mes_rep)
                     _metas_c = get_metas(cli_id, int(mes_rep[:4]))
+                    _pu = st.session_state.get("pu_scenario")
+                    if _pu and _pu.get("periodo") != mes_rep[:7]:
+                        _pu = None
                     _pdf = pdf_reporte_cliente(nombre_sel, mes_rep[:7], ind, st.session_state.get("rep_lectura", ""),
                                                ef_a=_ef_a, ef_p=_ef_p, per_p=_per_p, rat=_rat,
                                                numero_mes=st.session_state.get("rep_numero", ""),
                                                acciones=st.session_state.get("rep_acciones", ""),
                                                valor_generado=st.session_state.get("rep_valor", ""),
-                                               metas=_metas_c)
+                                               metas=_metas_c, poder_uno=_pu)
                     st.download_button("📄 Descargar PDF para el cliente", data=_pdf,
                                        file_name="Reporte_CFO_" + nombre_sel.replace(" ", "_") + "_" + mes_rep[:7] + ".pdf",
                                        mime="application/pdf", key="rep_pdf_dl")
                     st.caption("El PDF toma la lectura escrita arriba. Si la editas, haz clic fuera del cuadro antes de descargar.")
                 except Exception as _e:
                     st.error("No se pudo generar el PDF: " + repr(_e))
+
+
+# ---------------------------------------------------------------------------
+# PODER DEL UNO - SIMULADOR DE PALANCAS (Scaling Up / Miltz)
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Poder del Uno — simulador de palancas")
+st.caption("Captura cuánto mueves cada palanca y mira el efecto en utilidad y caja, sobre la temporalidad que elijas. "
+           "El escenario calculado se pasa al PDF del cliente del mismo mes.")
+_ppu = periodos_cargados(cli_id)
+if not _ppu:
+    st.caption("Carga al menos un mes para usar el simulador.")
+else:
+    mes_pu = st.selectbox("Mes base", _ppu, key="pu_mes")
+    temp_pu = st.radio("Temporalidad", ["mensual", "ytd", "anualizado"], horizontal=True, key="pu_temp",
+                       format_func=lambda x: {"mensual": "Del mes", "ytd": "Acumulado del año", "anualizado": "Anualizado"}[x])
+    st.caption("Positivo = mejora. Precio/Volumen suben; Costo/Gastos bajan; Días por cobrar/inventario bajan; Días por pagar suben.")
+    _cu1, _cu2 = st.columns(2)
+    with _cu1:
+        pu_precio = st.number_input("Precio (% aumento)", value=1.0, step=0.5, key="pu_precio")
+        pu_vol    = st.number_input("Volumen (% aumento)", value=0.0, step=0.5, key="pu_vol")
+        pu_costo  = st.number_input("Costo de ventas (% reducción)", value=1.0, step=0.5, key="pu_costo")
+        pu_gastos = st.number_input("Gastos de operación (% reducción)", value=1.0, step=0.5, key="pu_gastos")
+    with _cu2:
+        pu_cxc = st.number_input("Días por cobrar (reducción)", value=0.0, step=5.0, key="pu_cxc")
+        pu_inv = st.number_input("Días de inventario (reducción)", value=0.0, step=5.0, key="pu_inv")
+        pu_cxp = st.number_input("Días por pagar (aumento)", value=0.0, step=5.0, key="pu_cxp")
+    if st.button("Calcular Poder del Uno"):
+        _resu = comparativo_estados(cli_id, mes_pu)
+        if not _resu:
+            st.error("No se encontró ese mes.")
+        else:
+            _efu, _efpu, _ = _resu
+            _baseu = base_poder_uno(_efu, _efpu, mes_pu[:7], temp_pu)
+            _mvu = dict(precio=pu_precio, volumen=pu_vol, costo=pu_costo, gastos=pu_gastos, cxc=pu_cxc, inv=pu_inv, cxp=pu_cxp)
+            _filas, _du, _dc, _trampa, _ub = poder_uno_tabla(_baseu, _mvu)
+            st.session_state["pu_scenario"] = dict(temporalidad=temp_pu, filas=_filas, du=_du, dc=_dc,
+                                                   trampa=_trampa, periodo=mes_pu[:7])
+            st.dataframe([{"Palanca": n, "Movimiento": mv,
+                           "Efecto": ("+" if v >= 0 else "-") + money(abs(v)), "Sobre": k} for n, mv, v, k in _filas],
+                         use_container_width=True, hide_index=True)
+            cc1, cc2 = st.columns(2)
+            cc1.metric("Cambio en utilidad", ("+" if _du >= 0 else "-") + money(abs(_du)))
+            cc2.metric("Cambio en caja", ("+" if _dc >= 0 else "-") + money(abs(_dc)))
+            if _trampa:
+                st.error("⚠️ Trampa de volumen: con margen bruto negativo (" + money(_ub) + "), vender más volumen REDUCE la utilidad. "
+                         "El sistema no lo maquilla: primero el margen, después el volumen.")
+            st.caption("Escenario guardado. Al generar el reporte del cliente de " + mes_pu[:7] + " se incluye esta página.")
 
 
 # ---------------------------------------------------------------------------
