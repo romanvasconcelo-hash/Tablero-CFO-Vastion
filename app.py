@@ -346,12 +346,65 @@ def _bmval(v, fmt):
     if fmt == "pct":  return "{:.1f}%".format(v*100)
     return "{:.2f}".format(v)
 
-def pdf_interno_2025(nombre, anio, serie, ef_cierre=None, dias_cierre=365, crecimiento=None):
+def _pdf_tabla_estado(pdf, t, Mg, CW, titulo, rows, ca, cp):
+    dual = cp is not None
+    if pdf.get_y() + 18 > 282: pdf.add_page()
+    pdf.set_x(Mg); pdf.set_fill_color(28,45,58); pdf.set_text_color(255,255,255); pdf.set_font("Helvetica","B",9)
+    pdf.cell(CW,6,t(" " + titulo), fill=True); pdf.ln(7)
+    pdf.set_x(Mg); pdf.set_text_color(127,140,141); pdf.set_font("Helvetica","B",7.5)
+    if dual:
+        pdf.cell(86,5,t("Concepto")); pdf.cell(34,5,t(ca),align="R"); pdf.cell(34,5,t(cp),align="R"); pdf.cell(CW-154,5,t("Variacion"),align="R")
+    else:
+        pdf.cell(120,5,t("Concepto")); pdf.cell(CW-120,5,t(ca),align="R")
+    pdf.ln(5)
+    for label, va, vp, bold in rows:
+        if pdf.get_y() + 5.2 > 286: pdf.add_page()
+        if va is None and vp is None:
+            pdf.set_x(Mg); pdf.set_fill_color(238,240,242); pdf.set_text_color(80,90,100); pdf.set_font("Helvetica","B",7.5)
+            pdf.cell(CW,5,t(" " + label), fill=True); pdf.ln(5); continue
+        pdf.set_x(Mg); pdf.set_text_color(44,62,80); pdf.set_font("Helvetica","B" if bold else "",8)
+        if dual:
+            pdf.cell(86,5,t(label)); pdf.cell(34,5,t(_fmt(va)),align="R")
+            pdf.cell(34,5,t(_fmt(vp) if vp is not None else "-"),align="R")
+            pdf.cell(CW-154,5,t(_fmt((va or 0)-(vp or 0))),align="R")
+        else:
+            pdf.cell(120,5,t(label)); pdf.cell(CW-120,5,t(_fmt(va)),align="R")
+        pdf.ln(5)
+    pdf.ln(3)
+
+def _pdf_tabla_ratios(pdf, t, Mg, CW, a_rows, p_rows, ca, cp):
+    pmap = {(s,l):(v,f) for s,l,v,f in p_rows} if p_rows else {}
+    dual = bool(p_rows); sec = None
+    for s,l,v,f in a_rows:
+        if s != sec:
+            if pdf.get_y() + 14 > 282: pdf.add_page()
+            pdf.set_x(Mg); pdf.set_fill_color(28,45,58); pdf.set_text_color(255,255,255); pdf.set_font("Helvetica","B",8.5)
+            pdf.cell(CW,6,t(" " + s), fill=True); pdf.ln(7)
+            pdf.set_x(Mg); pdf.set_text_color(127,140,141); pdf.set_font("Helvetica","B",7.5)
+            if dual:
+                pdf.cell(86,5,t("Ratio")); pdf.cell(34,5,t(ca),align="R"); pdf.cell(34,5,t(cp),align="R"); pdf.cell(CW-154,5,t("Variacion"),align="R")
+            else:
+                pdf.cell(120,5,t("Ratio")); pdf.cell(CW-120,5,t(ca),align="R")
+            pdf.ln(5); sec = s
+        if pdf.get_y() + 5 > 286: pdf.add_page()
+        vp = pmap.get((s,l),(None,f))[0]
+        pdf.set_x(Mg); pdf.set_text_color(44,62,80); pdf.set_font("Helvetica","",8)
+        if dual:
+            pdf.cell(86,5,t(l)); pdf.cell(34,5,t(_fr(v,f)),align="R")
+            pdf.cell(34,5,t(_fr(vp,f)),align="R"); pdf.cell(CW-154,5,t(_fvar(v,vp,f)),align="R")
+        else:
+            pdf.cell(120,5,t(l)); pdf.cell(CW-120,5,t(_fr(v,f)),align="R")
+        pdf.ln(5)
+    pdf.ln(3)
+
+def pdf_interno_2025(nombre, anio, serie, ef_cierre=None, dias_cierre=365, crecimiento=None,
+                     ef_cierre_prev=None, rat_now=None, rat_prev=None):
     """Reporte interno: modelo de negocio (cierre) + tendencia y resumen del ejercicio."""
     from fpdf import FPDF
     import io as _io
     def t(s):
         return (str(s).replace("\u2014","-").replace("\u2013","-").replace("\u2212","-")
+                .replace("\u0394","Var. ")
                 .encode("latin-1","replace").decode("latin-1"))
     W, Mg = 210, 12; CW = W - 2*Mg
     pdf = FPDF(orientation="P", unit="mm", format="A4"); pdf.set_auto_page_break(True, 15)
@@ -436,6 +489,34 @@ def pdf_interno_2025(nombre, anio, serie, ef_cierre=None, dias_cierre=365, creci
     pdf.multi_cell(CW,3.6,t("Apertura = primer mes cargado; Cierre = ultimo mes; Promedio = media de los meses. "
                             "Metas: rentabilidad 10% y liquidez/endeudamiento por parametros de licitacion federal. "
                             "Para clientes en recontabilizacion (Fase 0) la serie es diagnostico, no linea base valida (R-MET-06)."))
+
+    # ===== Estados financieros (cierre del ejercicio, comparativo vs anterior si existe) =====
+    if ef_cierre is not None:
+        ca = str(anio); cp = (str(anio-1) if ef_cierre_prev is not None else None)
+        pdf.add_page()
+        pdf.set_fill_color(28,45,58); pdf.rect(0,0,W,22,style="F")
+        pdf.set_text_color(255,255,255); pdf.set_xy(Mg,5); pdf.set_font("Helvetica","B",14)
+        pdf.cell(CW,7,t("Estados financieros - cierre " + str(anio)))
+        pdf.set_xy(Mg,13); pdf.set_font("Helvetica","",9)
+        pdf.cell(CW,5,t("Acumulado del ejercicio. Balance en posicion al cierre."))
+        pdf.set_y(27)
+        _pdf_tabla_estado(pdf, t, Mg, CW, "Estado de resultados", er_rows_cmp(ef_cierre, ef_cierre_prev), ca, cp)
+        _pdf_tabla_estado(pdf, t, Mg, CW, "Balance general", bg_rows_cmp(ef_cierre, ef_cierre_prev), ca, cp)
+        _pdf_tabla_estado(pdf, t, Mg, CW, "Estado de flujo de efectivo", efe_rows_cmp(ef_cierre, ef_cierre_prev), ca, cp)
+        ok_efe, causa_efe, _acc = _efe_diag(ef_cierre["efe"])
+        pdf.set_text_color((39,174,96) if ok_efe else (192,57,43)); pdf.set_font("Helvetica","",7.5)
+        pdf.multi_cell(CW,3.6,t("Flujo cuadrado al cierre." if ok_efe else ("Flujo no cuadra: " + causa_efe)))
+
+    # ===== Razones financieras (cierre del ejercicio) =====
+    if rat_now:
+        pdf.add_page()
+        pdf.set_fill_color(28,45,58); pdf.rect(0,0,W,22,style="F")
+        pdf.set_text_color(255,255,255); pdf.set_xy(Mg,5); pdf.set_font("Helvetica","B",14)
+        pdf.cell(CW,7,t("Razones financieras - cierre " + str(anio)))
+        pdf.set_xy(Mg,13); pdf.set_font("Helvetica","",9)
+        pdf.cell(CW,5,t("Acumulado del ejercicio a la fecha de cierre, sin anualizar."))
+        pdf.set_y(27)
+        _pdf_tabla_ratios(pdf, t, Mg, CW, rat_now, rat_prev, str(anio), (str(anio-1) if rat_prev else None))
     return bytes(pdf.output())
 
 
@@ -872,7 +953,7 @@ def er_rows_cmp(ef_a, ef_p):
     A = ef_a['ytd']; p = ef_p['ytd'] if ef_p else {}
     L = [('Ingresos','ing',False),('(−) Costo de ventas','cos',False),('= Utilidad bruta','ub',True),
          ('(−) Gastos de operación','gas',False),('(−) Depreciación','dep',False),
-         ('= Utilidad de operación (EBIT)','ebit',True),
+         ('= Utilidad de operación','ebit',True),
          ('(−) Resultado financiero neto','fin',False),('= Utilidad antes de impuestos','uai',True)]
     return [(lbl, A.get(k), p.get(k), b) for lbl, k, b in L]
 
@@ -1573,17 +1654,20 @@ else:
                 st.warning("No hay meses cargados para el ejercicio " + str(anio_int) + ".")
             else:
                 _cie = cierre_ejercicio(cli_id, anio_int)
-                _efc = None; _diasc = 365; _crec = None
+                _efc = None; _diasc = 365; _crec = None; _efp = None; _rn = None; _rp = None
                 if _cie:
                     _efc = estados_financieros(_cie[1]); _diasc = _dias_ytd(_cie[0])
+                    _rnall = ratios_mensuales(cli_id, _cie[0] + "-01"); _rn = _rnall[0] if _rnall else None
                     _ciep = cierre_ejercicio(cli_id, anio_int - 1)
                     if _ciep:
                         _efp = estados_financieros(_ciep[1])
                         if _efp["ytd"]["ing"]:
                             _crec = _efc["ytd"]["ing"] / _efp["ytd"]["ing"] - 1
+                        _rpall = ratios_mensuales(cli_id, _ciep[0] + "-01"); _rp = _rpall[0] if _rpall else None
                 try:
                     _pdfint = pdf_interno_2025(nombre_sel, anio_int, serie,
-                                               ef_cierre=_efc, dias_cierre=_diasc, crecimiento=_crec)
+                                               ef_cierre=_efc, dias_cierre=_diasc, crecimiento=_crec,
+                                               ef_cierre_prev=_efp, rat_now=_rn, rat_prev=_rp)
                     st.download_button("📄 Descargar reporte interno", data=_pdfint,
                                        file_name="Reporte_Interno_" + nombre_sel.replace(" ", "_") + "_" + str(anio_int) + ".pdf",
                                        mime="application/pdf", key="int_dl")
