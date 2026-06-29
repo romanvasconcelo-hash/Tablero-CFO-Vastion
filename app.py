@@ -10,20 +10,20 @@ from psycopg2.extras import execute_values
 import xml.etree.ElementTree as ET
 import openpyxl, hashlib, io
 from datetime import datetime, date
- 
+
 st.set_page_config(page_title="Tablero CFO Vastion", page_icon="📊", layout="centered")
- 
+
 def get_conn():
     s = st.secrets["db"]
     return psycopg2.connect(host=s["host"], port=s["port"], dbname=s["dbname"],
                             user=s["user"], password=s["password"])
- 
+
 # ---------------------------------------------------------------------------
 # PARSERS
 # ---------------------------------------------------------------------------
 def _ns(root): return root.tag[root.tag.find('{')+1:root.tag.find('}')]
 def _sha(data): return hashlib.sha256(data).hexdigest()
- 
+
 def clasificar(nombre, data):
     if nombre.lower().endswith('.xml'):
         root = ET.fromstring(data); tag = root.tag.lower()
@@ -36,14 +36,14 @@ def clasificar(nombre, data):
         if 'EGRESO' in s:  return 'CFDI_RECIBIDO'
         return 'XLSX_DESCONOCIDO'
     return 'DESCONOCIDO'
- 
+
 def parse_catalogo(data):
     root = ET.fromstring(data); ns = {'x': _ns(root)}
     return [dict(num_cuenta=c.attrib['NumCta'], descripcion=c.attrib.get('Desc'),
         cod_agrupador=c.attrib.get('CodAgrup'), subcuenta_de=c.attrib.get('SubCtaDe'),
         nivel=int(c.attrib['Nivel']) if c.attrib.get('Nivel') else None,
         naturaleza=c.attrib.get('Natur')) for c in root.findall('x:Ctas', ns)]
- 
+
 def parse_balanza(data):
     root = ET.fromstring(data); ns = {'x': _ns(root)}
     meta = dict(rfc=root.attrib.get('RFC'), anio=root.attrib.get('Anio'),
@@ -51,7 +51,7 @@ def parse_balanza(data):
     rows = [(c.attrib['NumCta'], float(c.attrib['SaldoIni']), float(c.attrib['Debe']),
              float(c.attrib['Haber']), float(c.attrib['SaldoFin'])) for c in root.findall('x:Ctas', ns)]
     return meta, rows
- 
+
 def _num(v):
     try: return float(v) if v not in (None, '') else None
     except: return None
@@ -68,7 +68,7 @@ def _col(h, n):
         if c and n.lower()==str(c).strip().lower(): return i
     for i,c in enumerate(h):
         if c and n.lower() in str(c).strip().lower(): return i
- 
+
 def parse_cfdi(data):
     wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     ws = wb[wb.sheetnames[0]]; direc = 'EMITIDO' if 'INGRESO' in wb.sheetnames[0].upper() else 'RECIBIDO'
@@ -91,7 +91,7 @@ def parse_cfdi(data):
             _num(r[C['sub']]),_num(r[C['desc']]),_num(r[C['iva16']]),_num(r[C['iva8']]),
             _num(r[C['ivar']]),_num(r[C['isrr']]),_num(r[C['total']]),acc,r[C['cco']],r[C['uuidr']]))
     return out
- 
+
 # ---------------------------------------------------------------------------
 # CARGA + VALIDACIÓN
 # ---------------------------------------------------------------------------
@@ -103,7 +103,7 @@ def registrar(cur, cli, per, tipo, envio, nombre, data):
     if row: return row[0], True
     cur.execute("SELECT id FROM origen_archivo WHERE cliente_id=%s AND periodo=%s AND tipo=%s AND hash_sha256=%s",
                 (cli, per, tipo, _sha(data))); return cur.fetchone()[0], False
- 
+
 def procesar(cli, archivos):
     conn = get_conn(); conn.autocommit = False; cur = conn.cursor()
     try:
@@ -158,7 +158,7 @@ def procesar(cli, archivos):
         conn.rollback(); raise
     finally:
         cur.close(); conn.close()
- 
+
 # ---------------------------------------------------------------------------
 # INDICADORES (reporte interno)
 # ---------------------------------------------------------------------------
@@ -187,17 +187,17 @@ def cargar_indicadores(bal_id, cli, per):
         return ind
     finally:
         cur.close(); conn.close()
- 
+
 def sem_pretax(p):
     if p is None: return "—"
     if p >= 10: return "🟢 Sano (≥10%)"
     if p >= 5:  return "🟡 Mínimo (5–9%)"
     return "🔴 Peligro (<5%)"
- 
+
 def money(v):
     return "—" if v is None else f"${v:,.0f}"
- 
- 
+
+
 def _efe_diag(efe):
     """R-EFE-01 -> (cuadra, causa, accion). Traduce el descuadre a la causa raiz y la accion."""
     if efe.get("cuadra", True):
@@ -214,8 +214,8 @@ def _efe_diag(efe):
                "Revisar la captura/cierre de la apertura del ejercicio."
     return False, "El flujo no cuadra por " + _fmt(plug) + " con apertura correcta: un agrupador mueve efectivo sin origen.", \
            "Revisar la clasificacion de agrupadores de financiamiento/inversion."
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # REPORTE INTERNO · Comportamiento del ejercicio (tendencia + resumen)
 # ---------------------------------------------------------------------------
@@ -228,7 +228,7 @@ SERIE_SPEC = [
     ("Caja al cierre",           "caja",   "money",   None, None),
     ("Endeudamiento (PT / AT)",  "pt_at",  "pctfrac", 0.70, "menor"),    # licitacion
 ]
- 
+
 def serie_anual(cli, anio):
     """Recorre los meses cargados del ejercicio y arma la serie de indicadores clave."""
     import datetime as _dt
@@ -255,7 +255,7 @@ def serie_anual(cli, anio):
             pt_at=(s["pasivo"]/s["activo"]) if s["activo"] else None,
         ))
     return serie
- 
+
 def _fig_tendencia(serie):
     """Panel 2x3 de tendencia del ejercicio -> PNG bytes. Linea de meta punteada donde hay ancla."""
     import matplotlib; matplotlib.use("Agg")
@@ -280,7 +280,7 @@ def _fig_tendencia(serie):
     fig.tight_layout(pad=1.2)
     buf = _io.BytesIO(); fig.savefig(buf, format="png", dpi=150); plt.close(fig)
     return buf.getvalue()
- 
+
 def _fserie(v, fmt):
     if v is None: return "-"
     if fmt=="pct":     return "{:.1f}%".format(v)
@@ -288,8 +288,64 @@ def _fserie(v, fmt):
     if fmt=="money":   return _fmt(v)
     if fmt=="pctfrac": return "{:.1f}%".format(v*100)
     return "{:.2f}".format(v)
- 
-def pdf_interno_2025(nombre, anio, serie):
+
+def _dias_ytd(per):
+    import datetime
+    y, m = int(per[:4]), int(per[5:7])
+    d = datetime.date(y,12,31) if m==12 else datetime.date(y,m+1,1)-datetime.timedelta(days=1)
+    return d.timetuple().tm_yday
+
+def cierre_ejercicio(cli, anio):
+    """Ultimo mes cargado del ejercicio -> (periodo 'YYYY-MM', archivo_vigente). None si no hay."""
+    import datetime as _dt
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""SELECT periodo, archivo_vigente FROM periodo_estado
+                       WHERE cliente_id=%s AND archivo_vigente IS NOT NULL
+                         AND periodo>=%s AND periodo<=%s ORDER BY periodo DESC LIMIT 1""",
+                    (cli, _dt.date(anio,1,1), _dt.date(anio,12,1)))
+        r = cur.fetchone()
+        return (str(r[0])[:7], r[1]) if r else None
+    finally:
+        cur.close(); conn.close()
+
+def modelo_negocio(ef, dias):
+    """Tabla 3.10 de Alexander con los indicadores que el sistema ya calcula (cierre del ejercicio)."""
+    y = ef["ytd"]; s = _stocks_de(ef); ing = y["ing"]
+    sd = lambda a,b: (a/b) if b else None
+    un = y.get("un", y["uai"]); isr = y.get("isr_prov", 0.0)
+    prof = [
+        ("Ventas", ing, 1.0),
+        ("(-) Costo de ventas", y["cos"], sd(y["cos"], ing)),
+        ("= Margen bruto", y["ub"], sd(y["ub"], ing)),
+        ("(-) Gastos de operacion", y["gas"], sd(y["gas"], ing)),
+        ("(-) Depreciacion", y["dep"], sd(y["dep"], ing)),
+        ("= Utilidad de operacion (EBIT)", y["ebit"], sd(y["ebit"], ing)),
+        ("(-) Resultado financiero neto", y["fin"], sd(y["fin"], ing)),
+        ("(-) ISR provisional", isr, sd(isr, ing)),
+        ("= Utilidad neta", un, sd(un, ing)),
+    ]
+    dso = sd(s["cxc"], ing); dio = sd(s["inv"], y["cos"])
+    asset = [
+        ("Dias cuentas por cobrar (DSO)", (dso*dias if dso is not None else None), "dias"),
+        ("Dias de inventario (DIO)", (dio*dias if dio is not None else None), "dias"),
+        ("Rotacion de capital operativo", sd(ing, ef["cash"]["opcap"]), "x"),
+        ("Rotacion de activo fijo", sd(ing, s["afn"]), "x"),
+        ("Rotacion de activo total", sd(ing, s["activo"]), "x"),
+    ]
+    lev = [("Deuda / Capital total", sd(s["pasivo"], s["pasivo"]+s["capital"]), "pct")]
+    ret = [("ROE (Utilidad neta / Capital)", sd(un, s["capital"]), "pct"),
+           ("ROIC (EBIT / Capital empleado)", sd(y["ebit"], s["activo"]-s["pas_circ"]), "pct")]
+    return dict(prof=prof, asset=asset, lev=lev, ret=ret)
+
+def _bmval(v, fmt):
+    if v is None: return "-"
+    if fmt == "dias": return "{:,.0f} dias".format(v)
+    if fmt == "x":    return "{:.2f}x".format(v)
+    if fmt == "pct":  return "{:.1f}%".format(v*100)
+    return "{:.2f}".format(v)
+
+def pdf_interno_2025(nombre, anio, serie, ef_cierre=None, dias_cierre=365, crecimiento=None):
     """Reporte interno: header + grafica de tendencia + tabla resumen (apertura/cierre/promedio)."""
     from fpdf import FPDF
     import io as _io
@@ -337,9 +393,49 @@ def pdf_interno_2025(nombre, anio, serie):
     pdf.multi_cell(CW,3.6,t("Apertura = primer mes cargado; Cierre = ultimo mes; Promedio = media de los meses. "
                             "Metas: Pre-Tax 10% y liquidez/endeudamiento por parametros de licitacion federal. "
                             "Para clientes en recontabilizacion (Fase 0) la serie es diagnostico, no linea base valida (R-MET-06)."))
+
+    # ===== Pagina: Modelo de Negocio (Alexander, Tabla 3.10) =====
+    if ef_cierre is not None:
+        mn = modelo_negocio(ef_cierre, dias_cierre)
+        pdf.add_page()
+        pdf.set_fill_color(28,45,58); pdf.rect(0,0,W,22,style="F")
+        pdf.set_text_color(255,255,255); pdf.set_xy(Mg,5); pdf.set_font("Helvetica","B",14)
+        pdf.cell(CW,7,t("Modelo de negocio (Alexander) - cierre " + str(anio)))
+        pdf.set_xy(Mg,13); pdf.set_font("Helvetica","",9)
+        pdf.cell(CW,5,t("Como gana dinero el negocio: rentabilidad, uso de activos, apalancamiento y retornos."))
+        pdf.set_y(27)
+        if crecimiento is not None:
+            pdf.set_x(Mg); pdf.set_text_color(44,62,80); pdf.set_font("Helvetica","",9)
+            pdf.cell(CW,6,t("Crecimiento de ventas vs ejercicio anterior: {:+.1f}%".format(crecimiento*100))); pdf.ln(8)
+        def _band(titulo):
+            yb = pdf.get_y()
+            pdf.set_fill_color(28,45,58); pdf.rect(Mg,yb,CW,6,style="F")
+            pdf.set_xy(Mg+1.5,yb+1); pdf.set_text_color(255,255,255); pdf.set_font("Helvetica","B",8.5)
+            pdf.cell(CW-3,4,t(titulo)); pdf.set_y(yb+8)
+        _band("PROFITABILITY MODEL  (rentabilidad, P&L de gestion)")
+        pdf.set_x(Mg); pdf.set_text_color(127,140,141); pdf.set_font("Helvetica","B",7.5)
+        pdf.cell(96,5,t("Concepto")); pdf.cell(50,5,t("Monto"),align="R"); pdf.cell(CW-146,5,t("% ventas"),align="R"); pdf.ln(5)
+        for lbl, monto, pct in mn["prof"]:
+            bold = lbl.startswith("=")
+            pdf.set_x(Mg); pdf.set_text_color(44,62,80); pdf.set_font("Helvetica","B" if bold else "",8)
+            pdf.cell(96,5,t(lbl)); pdf.cell(50,5,t(_fmt(monto)),align="R")
+            pdf.cell(CW-146,5,t("{:.1f}%".format(pct*100) if pct is not None else "-"),align="R"); pdf.ln(5)
+        pdf.ln(2)
+        for titulo, rows in [("ASSET UTILIZATION  (uso de activos)", mn["asset"]),
+                             ("LEVERAGE  (apalancamiento)", mn["lev"]),
+                             ("RETURNS  (retornos)", mn["ret"])]:
+            _band(titulo)
+            for lbl, val, fmt in rows:
+                pdf.set_x(Mg); pdf.set_text_color(44,62,80); pdf.set_font("Helvetica","",8)
+                pdf.cell(120,5,t(lbl)); pdf.cell(CW-120,5,t(_bmval(val,fmt)),align="R"); pdf.ln(5)
+            pdf.ln(2)
+        pdf.set_text_color(127,140,141); pdf.set_font("Helvetica","",7.5)
+        pdf.multi_cell(CW,3.6,t("Estructura del modelo de negocio segun Alexander (Tabla 3.10), poblada con los indicadores "
+                                "del sistema al cierre del ejercicio. El modelo explica la estructura (margen x rotacion x "
+                                "apalancamiento -> ROIC); las metas vienen de fuentes externas, no de esta tabla."))
     return bytes(pdf.output())
- 
- 
+
+
 def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per_p=None, rat=None):
     """Reporte CFO mensual del cliente en PDF (una página). Caja al centro."""
     from fpdf import FPDF
@@ -353,13 +449,13 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
     pdf = FPDF(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=16)
     pdf.add_page()
- 
+
     pdf.set_fill_color(28, 45, 58)
     pdf.rect(0, 0, W, 30, style="F")
     pdf.set_text_color(255, 255, 255)
     pdf.set_xy(Mg, 8);  pdf.set_font("Helvetica", "B", 18); pdf.cell(CW, 8, t("Reporte CFO Mensual"))
     pdf.set_xy(Mg, 18); pdf.set_font("Helvetica", "", 11);  pdf.cell(CW, 6, t(nombre + "   |   " + periodo))
- 
+
     pdf.set_text_color(44, 62, 80)
     pdf.set_xy(Mg, 40); pdf.set_font("Helvetica", "", 11); pdf.cell(CW, 6, t("Tu caja al cierre del mes"))
     pdf.set_xy(Mg, 47); pdf.set_font("Helvetica", "B", 30); pdf.cell(CW, 14, t(m(ind.get("caja"))))
@@ -373,7 +469,7 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
         pdf.cell(CW, 6, t(txt))
     else:
         pdf.set_text_color(127, 140, 141); pdf.cell(CW, 6, t("Sin mes anterior para comparar"))
- 
+
     p = ind.get("pretax_pct")
     if   p is None: c_rent, n_rent = (149,165,166), "Sin dato"
     elif p >= 10:   c_rent, n_rent = (39,174,96),  "Sano"
@@ -385,7 +481,7 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
     if   cl is None: c_cl, n_cl = (149,165,166), "Sin dato"
     elif cl > 0:     c_cl, n_cl = (192,57,43),  "La utilidad no llego a caja"
     else:            c_cl, n_cl = (39,174,96),  "La caja subio con la utilidad"
- 
+
     def card(x, y, w, h, titulo, valor, color, nota):
         pdf.set_draw_color(220, 223, 227); pdf.set_fill_color(248, 249, 250)
         pdf.rect(x, y, w, h, style="DF")
@@ -396,13 +492,13 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
         pdf.cell(w - 6, 8, t(valor))
         pdf.set_xy(x + 3, y + 23); pdf.set_text_color(*color); pdf.set_font("Helvetica", "", 8)
         pdf.multi_cell(w - 6, 4, t(nota))
- 
+
     y0, gap = 74, 4
     cw = (CW - 2 * gap) / 3
     card(Mg,                y0, cw, 32, "Rentabilidad del mes",     v_rent, c_rent,     n_rent)
     card(Mg + cw + gap,     y0, cw, 32, "Margen de tu operacion",   v_mb,   (52,73,94), "Segun sector")
     card(Mg + 2*(cw + gap), y0, cw, 32, "Brecha utilidad vs. caja", m(cl),  c_cl,       n_cl)
- 
+
     yN = y0 + 32 + 10
     pdf.set_xy(Mg, yN); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B", 12)
     pdf.cell(CW, 7, t("Lo que esto significa"))
@@ -411,12 +507,12 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
     pdf.set_xy(Mg + 3, yN + 12); pdf.set_font("Helvetica", "", 10.5); pdf.set_text_color(44, 62, 80)
     texto = lectura.strip() if (lectura and lectura.strip()) else "(La lectura del mes la escribe el CFO antes de enviar el reporte al cliente.)"
     pdf.multi_cell(CW - 6, 5.5, t(texto))
- 
+
     pdf.set_auto_page_break(False, 0)
     pdf.set_y(-14); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 8)
     pdf.cell(0, 5, t("Vastion Accounting   |   Confidencial   |   Los numeros los pone el sistema; la lectura la escribe el CFO."), align="C")
     pdf.set_auto_page_break(True, 16)
- 
+
     # ========================= ANEXO TÉCNICO =========================
     def _fila(label, sa, sp, sv, dual, bold=False, header=False):
         rh = 5.2
@@ -437,7 +533,7 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
         else:
             pdf.cell(118, rh, t(lab)); pdf.cell(60, rh, t(sa), align="R")
         pdf.ln(rh)
- 
+
     def _colhead(dual, ca, cpx):
         pdf.set_x(Mg); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "B", 7.5)
         if dual:
@@ -446,7 +542,7 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
         else:
             pdf.cell(118, 5, t("Concepto")); pdf.cell(60, 5, t(ca), align="R")
         pdf.ln(5)
- 
+
     def _estado(titulo, rows, dual, ca, cpx):
         if pdf.get_y() + 24 > 281: pdf.add_page()
         _fila(titulo, None, None, None, dual, header=True)
@@ -460,7 +556,7 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
                 sv = _fmt((va or 0) - (vp or 0)) if dual else None
                 _fila(label, sa, sp, sv, dual, bold=bold)
         pdf.ln(3)
- 
+
     def _banner_anexo(titulo, nota):
         pdf.add_page()
         pdf.set_fill_color(28, 45, 58); pdf.rect(0, 0, W, 16, style="F")
@@ -468,7 +564,7 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
         pdf.cell(CW, 8, t(titulo))
         pdf.set_xy(Mg, 20); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 7.5)
         pdf.multi_cell(CW, 4, t(nota)); pdf.ln(2)
- 
+
     cp_lbl = (per_p[:7] if per_p else None)
     if ef_a is not None:
         _banner_anexo("Anexo - Estados financieros  ·  " + periodo,
@@ -487,7 +583,7 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
         _estado("Estado de Resultados", er_rows_cmp(ef_a, ef_p), dual, periodo, cp_lbl)
         _estado("Balance General", bg_rows_cmp(ef_a, ef_p), dual, periodo, cp_lbl)
         _estado("Estado de Flujo de Efectivo", efe_rows_cmp(ef_a, ef_p), dual, periodo, cp_lbl)
- 
+
     if rat is not None and rat[0]:
         a_rows, p_rows, rper = rat
         _banner_anexo("Anexo - Razones financieras  ·  " + periodo,
@@ -506,10 +602,10 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
             sa = _fr(v, f); sp = _fr(vp, f) if pdual else None
             sv = _fvar(v, vp, f) if pdual else None
             _fila(l, sa, sp, sv, pdual)
- 
+
     return bytes(pdf.output())
- 
- 
+
+
 def tendencia(cli):
     conn = get_conn(); cur = conn.cursor(); out = []
     try:
@@ -528,8 +624,8 @@ def tendencia(cli):
         return out
     finally:
         cur.close(); conn.close()
- 
- 
+
+
 def datos_reporte_cliente(cli, periodo):
     conn = get_conn(); cur = conn.cursor()
     try:
@@ -553,7 +649,7 @@ def datos_reporte_cliente(cli, periodo):
     ind['caja_prev'] = caja_prev
     ind['caja_var'] = (ind['caja'] - caja_prev) if (ind['caja'] is not None and caja_prev is not None) else None
     return ind
- 
+
 def periodos_cargados(cli):
     conn = get_conn(); cur = conn.cursor()
     try:
@@ -562,8 +658,8 @@ def periodos_cargados(cli):
         return [str(r[0]) for r in cur.fetchall()]
     finally:
         cur.close(); conn.close()
- 
- 
+
+
 SAT_LBL = {
     '101':'Caja','102':'Bancos','103':'Inversiones','104':'Inversiones',
     '105':'Clientes','106':'Documentos por cobrar','107':'Deudores diversos',
@@ -584,7 +680,7 @@ SAT_LBL = {
     '304':'Resultados de ejercicios anteriores','305':'Resultado del ejercicio',
 }
 def _lbl(code): return SAT_LBL.get(code, "Agrupador " + (code or "?"))
- 
+
 def estados_financieros(archivo_id):
     """ER (NIF) + Balance General + EFE (indirecto) por partida. Lógica validada en datos reales."""
     from collections import defaultdict
@@ -729,11 +825,11 @@ def estados_financieros(archivo_id):
     cash = dict(uai=ytd['uai'], dep=ytd['dep'], capex=capex, opcap=opcap, opcap_ini=opcap_ini,
                 dopcap=dopcap, generador=generador, isr_prov=isr_prov, un=ytd['un'], inv_inmovil=inv_inmovil)
     return dict(er=er, bg=bg, efe=efe, ytd=ytd, cash=cash)
- 
+
 def _fmt(v):
     if v is None: return "—"
     return ("(${:,.0f})".format(abs(v))) if v < 0 else ("${:,.0f}".format(v))
- 
+
 def _cmp_md(rows, col_a, col_p):
     out = ["| Concepto | " + col_a + " | " + col_p + " | Variación |", "|---|--:|--:|--:|"]
     for label, va, vp, bold in rows:
@@ -746,7 +842,7 @@ def _cmp_md(rows, col_a, col_p):
             else:
                 out.append("| " + label + " | " + _fmt(va) + " | " + _fmt(vp) + " | " + _fmt(var) + " |")
     return "\n".join(out)
- 
+
 def comparativo_estados(cli, per_actual):
     conn = get_conn(); cur = conn.cursor()
     try:
@@ -763,12 +859,12 @@ def comparativo_estados(cli, per_actual):
     ef_p = estados_financieros(rp[1]) if rp else None
     per_p = str(rp[0])[:7] if rp else None
     return ef_a, ef_p, per_p
- 
+
 def _bg_sec(g):
     if g[:1] == '1': return ('Activo circulante', 1) if g < '150' else ('Activo no circulante', 1)
     if g[:1] == '2': return ('Pasivo corto plazo', -1) if g < '250' else ('Pasivo largo plazo', -1)
     return ('Capital contable', -1)
- 
+
 def er_rows_cmp(ef_a, ef_p):
     A = ef_a['ytd']; p = ef_p['ytd'] if ef_p else {}
     L = [('Ingresos','ing',False),('(−) Costo de ventas','cos',False),('= Utilidad bruta','ub',True),
@@ -776,7 +872,7 @@ def er_rows_cmp(ef_a, ef_p):
          ('= Utilidad de operación (EBIT)','ebit',True),
          ('(−) Resultado financiero neto','fin',False),('= Utilidad antes de impuestos','uai',True)]
     return [(lbl, A.get(k), p.get(k), b) for lbl, k, b in L]
- 
+
 def bg_rows_cmp(ef_a, ef_p):
     sa = ef_a['bg']['saldo_g']; sp = ef_p['bg']['saldo_g'] if ef_p else {}
     codes = sorted(set(sa) | set(sp))
@@ -807,7 +903,7 @@ def bg_rows_cmp(ef_a, ef_p):
                  ef_a['bg']['tot_pas'] + ef_a['bg']['tot_cap'],
                  ((ef_p['bg']['tot_pas'] + ef_p['bg']['tot_cap']) if ef_p else None), True))
     return rows
- 
+
 def efe_rows_cmp(ef_a, ef_p):
     aa = ef_a['efe']['acc']; ap = ef_p['efe']['acc'] if ef_p else {}
     keys = sorted(set(aa) | set(ap))
@@ -830,8 +926,8 @@ def efe_rows_cmp(ef_a, ef_p):
                  ((P.get('efec_ini') or 0)+(P.get('suma') or 0)) if ef_p else None, True))
     rows.append(('Efectivo al final (real, Caja + Bancos)', ef_a['efe']['efec_fin'], P.get('efec_fin'), False))
     return rows
- 
- 
+
+
 def _fr(v, fmt):
     if v is None: return "—"
     if fmt == 'pct':   return "{:.1f}%".format(v*100)
@@ -839,7 +935,7 @@ def _fr(v, fmt):
     if fmt == 'veces': return "{:.2f}x".format(v)
     if fmt == 'pesos': return _fmt(v)
     return "{:.2f}".format(v)
- 
+
 def _fvar(va, vp, fmt):
     if va is None or vp is None: return "—"
     d = va - vp
@@ -848,7 +944,7 @@ def _fvar(va, vp, fmt):
     if fmt == 'veces': return "{:+.2f}x".format(d)
     if fmt == 'pesos': return _fmt(d)
     return "{:+.2f}".format(d)
- 
+
 def _stocks_de(ef):
     sg = ef['bg']['saldo_g']
     act_circ = sum(v for c,v in sg.items() if c[:1]=='1' and c < '150')
@@ -859,7 +955,7 @@ def _stocks_de(ef):
     afn = sum(v for c,v in sg.items() if '150' <= c < '180')
     return dict(act_circ=act_circ, pas_circ=pas_circ, cxc=cxc, inv=inv, cxp=cxp, afn=afn,
                 activo=ef['bg']['tot_act'], pasivo=ef['bg']['tot_pas'], capital=ef['bg']['tot_cap'])
- 
+
 # ---------------------------------------------------------------------------
 # CAPA META (R-MET) · metas fijas por ejercicio + elegibilidad de licitacion
 # ---------------------------------------------------------------------------
@@ -873,7 +969,7 @@ def get_metas(cli, ejercicio):
                            fuente=r[4], nota=r[5]) for r in cur.fetchall()}
     finally:
         cur.close(); conn.close()
- 
+
 def set_meta(cli, ejercicio, indicador, valor_meta, tipo='umbral', direccion='mayor_mejor', fuente=None, nota=None):
     conn = get_conn(); cur = conn.cursor()
     try:
@@ -886,13 +982,13 @@ def set_meta(cli, ejercicio, indicador, valor_meta, tipo='umbral', direccion='ma
         conn.commit()
     finally:
         cur.close(); conn.close()
- 
+
 # Constantes federales de licitacion (R-MET-03): se cablean, no se guardan en BD.
 LICIT_AC_PC = 1.1     # AC/PC minimo
 LICIT_AT_PT = 2.0     # AT/PT minimo
 LICIT_PT_AT = 0.70    # PT/AT maximo
 LICIT_CNT_PCT = 0.20  # CNT minimo = 20% de la propuesta sin IVA
- 
+
 def licitacion_eval(ef, propuesta):
     """Razones del balance vs parametros federales. Elegibilidad = a AND (b OR c). R-MET-03."""
     s = _stocks_de(ef)
@@ -909,7 +1005,7 @@ def licitacion_eval(ef, propuesta):
     return dict(AC=AC, PC=PC, AT=AT, PT=PT, cnt=cnt, cnt_meta=cnt_meta,
                 ac_pc=ac_pc, at_pt=at_pt, pt_at=pt_at, a=a, b=b, c=c,
                 elegible=elegible, propuesta=propuesta)
- 
+
 # Anclas duras (Crabtree) cableadas como default; meta_indicador las sobrescribe por cliente. R-SU-16.
 DEFAULT_METAS = {
     'pretax_pct': dict(tipo='umbral', direccion='mayor_mejor', valor_meta=10.0, fuente='crabtree',
@@ -919,11 +1015,11 @@ DEFAULT_METAS = {
     'cash_lag':   dict(tipo='umbral', direccion='menor_mejor', valor_meta=0.0,  fuente='crabtree',
                        nota='Cash Lag <=0: la utilidad llega a caja.'),
 }
- 
+
 def meta_de(indicador, metas):
     """Meta sembrada por cliente (meta_indicador) tiene prioridad sobre el default cableado."""
     return metas.get(indicador) or DEFAULT_METAS.get(indicador)
- 
+
 def evaluar_meta(valor, m):
     """Devuelve (brecha_firmada, estado). Brecha negativa = falta para llegar a la meta. R-MET-02."""
     if valor is None or not m or m.get('valor_meta') is None:
@@ -934,21 +1030,21 @@ def evaluar_meta(valor, m):
     if dirn == 'contextual':
         return brecha, 'contextual'
     return brecha, ('cumple' if brecha >= 0 else 'falta')
- 
+
 def _fmeta(v, fmt):
     if v is None: return "—"
     if fmt == 'pctnum': return "{:.1f}%".format(v)
     if fmt == 'x':      return "{:.2f}x".format(v)
     if fmt == 'pesos':  return _fmt(v)
     return "{:.2f}".format(v)
- 
+
 def _fmeta_brecha(v, fmt):
     if v is None: return "—"
     if fmt == 'pctnum': return "{:+.1f} pp".format(v)
     if fmt == 'x':      return "{:+.2f}x".format(v)
     if fmt == 'pesos':  return _fmt(v)
     return "{:+.2f}".format(v)
- 
+
 def tabla_avance_meta(items, metas):
     """items = [(label, indicador_key, valor, fmt)]. Tabla markdown Actual/Meta/Brecha/Estado, o None si nada tiene meta."""
     rows = ["| Indicador | Actual | Meta | Brecha | Estado |", "|---|--:|--:|--:|:--|"]
@@ -963,7 +1059,7 @@ def tabla_avance_meta(items, metas):
         rows.append("| " + label + " | " + _fmeta(valor, fmt) + " | " + _fmeta(m['valor_meta'], fmt) +
                     " | " + _fmeta_brecha(brecha, fmt) + " | " + edo_txt.get(estado, "—") + " |")
     return "\n".join(rows) if hay else None
- 
+
 def ratios_mensuales(cli, periodo):
     import datetime
     sd = lambda a,b: (a/b) if b else None
@@ -1044,30 +1140,30 @@ def ratios_mensuales(cli, periodo):
         ]
     iM = pers.index(periodo)
     return snap(iM), snap(iM-1), (pers[iM-1] if iM > 0 else None)
- 
+
 # ---------------------------------------------------------------------------
 # INTERFAZ
 # ---------------------------------------------------------------------------
 st.title("📊 Tablero CFO Vastion")
 st.caption("Carga mensual · arrastra los archivos del cliente y valida")
- 
+
 try:
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT id, nombre FROM cliente ORDER BY nombre")
     clientes = cur.fetchall(); cur.close(); conn.close()
 except Exception as e:
     st.error(f"No se pudo conectar a la base. Revisa los secrets. ({e})"); st.stop()
- 
+
 if not clientes:
     st.warning("No hay clientes registrados."); st.stop()
- 
+
 nombre_sel = st.selectbox("Cliente", [c[1] for c in clientes])
 cli_id = dict((c[1], c[0]) for c in clientes)[nombre_sel]
- 
+
 st.markdown("**Suelta aquí los archivos del mes** (balanza XML obligatoria; catálogo XML la primera vez; CFDI emitidos y recibidos):")
 subidos = st.file_uploader("Arrastra los archivos", accept_multiple_files=True,
                            type=['xml','xlsx'], label_visibility='collapsed')
- 
+
 archivos = {}
 if subidos:
     for f in subidos:
@@ -1077,7 +1173,7 @@ if subidos:
     st.info("Detecté: " + ", ".join(etiquetas.get(t, t) for t in archivos))
     if 'BALANZA' not in archivos:
         st.error("Falta la balanza (XML). Es obligatoria.")
- 
+
 if st.button("Cargar y validar", type="primary", disabled=not (subidos and 'BALANZA' in archivos)):
     with st.spinner("Cargando y validando…"):
         try:
@@ -1085,10 +1181,10 @@ if st.button("Cargar y validar", type="primary", disabled=not (subidos and 'BALA
             ind = cargar_indicadores(bal_id, cli_id, per)
         except Exception as e:
             st.error(f"Error al procesar: {e}"); st.stop()
- 
+
     bloqueo = any((not ok) and sev=='BLOQUEANTE' for _,ok,sev,_ in integ) or any((not ok) and sev=='BLOQUEANTE' for _,ok,sev,_ in madz)
     adv = any((not ok) and sev=='ADVERTENCIA' for _,ok,sev,_ in integ) or any((not ok) and sev=='ADVERTENCIA' for _,ok,sev,_ in madz)
- 
+
     st.divider()
     if bloqueo:
         st.error(f"## 🔴 RETENIDO · {per}\nEste periodo no entra al tablero. Corregir en contabilidad antes de reportar.")
@@ -1096,7 +1192,7 @@ if st.button("Cargar y validar", type="primary", disabled=not (subidos and 'BALA
         st.warning(f"## 🟡 VALIDADO con advertencias · {per}\nEl periodo entra, pero revisa las señales amarillas.")
     else:
         st.success(f"## 🟢 VALIDADO · {per}\nEl periodo entra al tablero.")
- 
+
     # ---- 3 indicadores clave, uno por eje ----
     st.subheader("Indicadores clave")
     c1, c2, c3 = st.columns(3)
@@ -1119,7 +1215,7 @@ if st.button("Cargar y validar", type="primary", disabled=not (subidos and 'BALA
         if ind['iva_neto'] is not None:
             st.caption(("IVA a cargo " + money(ind['iva_neto'])) if ind['iva_neto'] > 0
                        else ("IVA a favor " + money(abs(ind['iva_neto']))))
- 
+
     # ---- indicadores de apoyo ----
     st.subheader("Apoyo")
     a1, a2, a3, a4 = st.columns(4)
@@ -1127,7 +1223,7 @@ if st.button("Cargar y validar", type="primary", disabled=not (subidos and 'BALA
     a2.metric("Nómina / Ingresos", f"{ind['nomina_pct']}%" if ind['nomina_pct'] is not None else "—")
     a3.metric("GPLD", f"{ind['gpld']}x" if ind['gpld'] is not None else "n/a")
     a4.metric("Caja fin de mes", money(ind['caja']))
- 
+
     # ---- Avance contra meta (Actual · Meta · Brecha · Estado) ----
     st.subheader("Avance contra meta")
     _metas_b = get_metas(cli_id, int(per[:4]))
@@ -1141,13 +1237,13 @@ if st.button("Cargar y validar", type="primary", disabled=not (subidos and 'BALA
                    "Anclas duras Pre-Tax 10% y GPLD 1.35 (Crabtree); se sobrescriben por cliente desde meta_indicador.")
     else:
         st.caption("Sin metas definidas para este cliente/ejercicio.")
- 
+
     # ---- P&L de Gestión ----
     with st.expander("P&L de Gestión (no constituye estado de resultados NIF)"):
         st.dataframe(
             [{"Concepto": c, "Monto": f"{m:,.0f}", "%": (f"{p}%" if p is not None else "")} for c,m,p in ind['pl']],
             use_container_width=True, hide_index=True)
- 
+
     # ---- detalle de compuertas ----
     with st.expander("Detalle de validación"):
         st.markdown("**Integridad**")
@@ -1156,8 +1252,8 @@ if st.button("Cargar y validar", type="primary", disabled=not (subidos and 'BALA
         st.markdown("**Madurez analítica**")
         for p, ok, sev, det in madz:
             st.write((("✅" if ok else ("🟡" if sev=='ADVERTENCIA' else "❌"))) + f"  **{p}** ({sev}) — {det}")
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # COMPARATIVO DE MESES CARGADOS
 # ---------------------------------------------------------------------------
@@ -1181,8 +1277,8 @@ if st.button("Ver tendencia"):
             st.line_chart(caja_df)
         if any(d["flag"] for d in datos):
             st.caption("⚠️ Los meses marcados traen observaciones de contabilidad (en recontabilización). La tendencia puede no reflejar la operación real hasta que se ajusten.")
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # REPORTE DEL CLIENTE (vista dueño)
 # ---------------------------------------------------------------------------
@@ -1249,8 +1345,8 @@ else:
                     st.caption("El PDF toma la lectura escrita arriba. Si la editas, haz clic fuera del cuadro antes de descargar.")
                 except Exception as _e:
                     st.error("No se pudo generar el PDF: " + repr(_e))
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # ESTADOS FINANCIEROS FORMALES (NIF) - REPORTE MENSUAL
 # ---------------------------------------------------------------------------
@@ -1344,8 +1440,8 @@ else:
                 st.markdown("\n".join(fil))
                 if abs(efe["plug"]) < 1: st.success("EFE cuadrado (partida por identificar $0).")
                 else: st.warning("Partida por identificar: " + _fmt(efe["plug"]) + ".")
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # RATIOS FINANCIEROS MENSUALES (Alexander) - REPORTE MENSUAL
 # ---------------------------------------------------------------------------
@@ -1376,8 +1472,8 @@ else:
                 vp = pmap.get((s,l),(None,f))[0]
                 tabla.append("| " + l + " | " + _fr(v,f) + " | " + _fr(vp,f) + " | " + _fvar(v,vp,f) + " |")
             if tabla: st.markdown("\n".join(tabla))
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # ELEGIBILIDAD DE LICITACIÓN / CRÉDITO (capa cliente · constructoras) — R-MET
 # ---------------------------------------------------------------------------
@@ -1444,8 +1540,8 @@ else:
             st.caption("Brecha firmada: negativa = falta para llegar a la meta (R-MET-02). "
                        "Diagnóstico sobre la posición del mes; para clientes en recontabilización (Fase 0) "
                        "las razones del balance no son certificables hasta cerrar (R-MET-06).")
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # REPORTE INTERNO (comportamiento del ejercicio · uso Vastion)
 # ---------------------------------------------------------------------------
@@ -1473,8 +1569,18 @@ else:
             if not serie:
                 st.warning("No hay meses cargados para el ejercicio " + str(anio_int) + ".")
             else:
+                _cie = cierre_ejercicio(cli_id, anio_int)
+                _efc = None; _diasc = 365; _crec = None
+                if _cie:
+                    _efc = estados_financieros(_cie[1]); _diasc = _dias_ytd(_cie[0])
+                    _ciep = cierre_ejercicio(cli_id, anio_int - 1)
+                    if _ciep:
+                        _efp = estados_financieros(_ciep[1])
+                        if _efp["ytd"]["ing"]:
+                            _crec = _efc["ytd"]["ing"] / _efp["ytd"]["ing"] - 1
                 try:
-                    _pdfint = pdf_interno_2025(nombre_sel, anio_int, serie)
+                    _pdfint = pdf_interno_2025(nombre_sel, anio_int, serie,
+                                               ef_cierre=_efc, dias_cierre=_diasc, crecimiento=_crec)
                     st.download_button("📄 Descargar reporte interno", data=_pdfint,
                                        file_name="Reporte_Interno_" + nombre_sel.replace(" ", "_") + "_" + str(anio_int) + ".pdf",
                                        mime="application/pdf", key="int_dl")
