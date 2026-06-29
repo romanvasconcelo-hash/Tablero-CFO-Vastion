@@ -736,6 +736,56 @@ def _stocks_de(ef):
     return dict(act_circ=act_circ, pas_circ=pas_circ, cxc=cxc, inv=inv, cxp=cxp, afn=afn,
                 activo=ef['bg']['tot_act'], pasivo=ef['bg']['tot_pas'], capital=ef['bg']['tot_cap'])
  
+# ---------------------------------------------------------------------------
+# CAPA META (R-MET) · metas fijas por ejercicio + elegibilidad de licitacion
+# ---------------------------------------------------------------------------
+def get_metas(cli, ejercicio):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""SELECT indicador, tipo, direccion, valor_meta, fuente, nota
+                       FROM meta_indicador WHERE cliente_id=%s AND ejercicio=%s""", (cli, ejercicio))
+        return {r[0]: dict(tipo=r[1], direccion=r[2],
+                           valor_meta=(float(r[3]) if r[3] is not None else None),
+                           fuente=r[4], nota=r[5]) for r in cur.fetchall()}
+    finally:
+        cur.close(); conn.close()
+ 
+def set_meta(cli, ejercicio, indicador, valor_meta, tipo='umbral', direccion='mayor_mejor', fuente=None, nota=None):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""INSERT INTO meta_indicador (cliente_id,ejercicio,indicador,tipo,direccion,valor_meta,fuente,nota)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (cliente_id,ejercicio,indicador)
+                       DO UPDATE SET tipo=EXCLUDED.tipo, direccion=EXCLUDED.direccion, valor_meta=EXCLUDED.valor_meta,
+                                     fuente=EXCLUDED.fuente, nota=EXCLUDED.nota, actualizado=now()""",
+                    (cli, ejercicio, indicador, tipo, direccion, valor_meta, fuente, nota))
+        conn.commit()
+    finally:
+        cur.close(); conn.close()
+ 
+# Constantes federales de licitacion (R-MET-03): se cablean, no se guardan en BD.
+LICIT_AC_PC = 1.1     # AC/PC minimo
+LICIT_AT_PT = 2.0     # AT/PT minimo
+LICIT_PT_AT = 0.70    # PT/AT maximo
+LICIT_CNT_PCT = 0.20  # CNT minimo = 20% de la propuesta sin IVA
+ 
+def licitacion_eval(ef, propuesta):
+    """Razones del balance vs parametros federales. Elegibilidad = a AND (b OR c). R-MET-03."""
+    s = _stocks_de(ef)
+    AC, PC, AT, PT = s['act_circ'], s['pas_circ'], s['activo'], s['pasivo']
+    cnt   = AC - PC
+    ac_pc = (AC / PC) if PC else None
+    at_pt = (AT / PT) if PT else None
+    pt_at = (PT / AT) if AT else None
+    cnt_meta = (LICIT_CNT_PCT * propuesta) if propuesta else None
+    a = (cnt >= cnt_meta) if cnt_meta is not None else None
+    b = (ac_pc is not None and ac_pc >= LICIT_AC_PC) and (at_pt is not None and at_pt >= LICIT_AT_PT)
+    c = (pt_at is not None and pt_at <= LICIT_PT_AT)
+    elegible = (bool(a) and (bool(b) or bool(c))) if a is not None else None
+    return dict(AC=AC, PC=PC, AT=AT, PT=PT, cnt=cnt, cnt_meta=cnt_meta,
+                ac_pc=ac_pc, at_pt=at_pt, pt_at=pt_at, a=a, b=b, c=c,
+                elegible=elegible, propuesta=propuesta)
+ 
 def ratios_mensuales(cli, periodo):
     import datetime
     sd = lambda a,b: (a/b) if b else None
@@ -1134,4 +1184,72 @@ else:
                 vp = pmap.get((s,l),(None,f))[0]
                 tabla.append("| " + l + " | " + _fr(v,f) + " | " + _fr(vp,f) + " | " + _fvar(v,vp,f) + " |")
             if tabla: st.markdown("\n".join(tabla))
+ 
+ 
+# ---------------------------------------------------------------------------
+# ELEGIBILIDAD DE LICITACIÓN / CRÉDITO (capa cliente · constructoras) — R-MET
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Elegibilidad de licitación / crédito — constructoras")
+st.caption("Capa cliente. Razones del balance contra los parámetros financieros de obra pública federal. "
+           "Posición adelantada del mes — el dato certificable es el cierre anual del SAT (R-MET-04).")
+_plic = periodos_cargados(cli_id)
+if not _plic:
+    st.caption("Carga al menos un mes para evaluar elegibilidad.")
+else:
+    mes_lic = st.selectbox("Mes (posición adelantada)", _plic, key="lic_mes")
+    ejercicio = int(mes_lic[:4])
+    metas = get_metas(cli_id, ejercicio)
+    prop_row = metas.get("licit_propuesta")
+    propuesta = prop_row["valor_meta"] if prop_row else None
+    with st.expander("Meta del ejercicio (onboarding) — ¿a cuánto de obra quieres concursar?",
+                     expanded=(propuesta is None)):
+        st.caption("Un solo dato fija toda la meta de licitación del ejercicio: el CNT meta = 20% de la propuesta.")
+        nueva = st.number_input("Propuesta objetivo del ejercicio " + str(ejercicio) + " (sin IVA, MXN)",
+                                min_value=0.0, value=float(propuesta) if propuesta else 0.0,
+                                step=1_000_000.0, format="%.0f", key="lic_prop")
+        if st.button("Guardar meta del ejercicio", key="lic_save"):
+            set_meta(cli_id, ejercicio, "licit_propuesta", nueva, tipo="umbral", direccion="mayor_mejor",
+                     fuente="licitacion", nota="Propuesta objetivo sin IVA; CNT meta = 20% de este valor.")
+            st.success("Meta guardada para el ejercicio " + str(ejercicio) + ". Vuelve a generar para ver la evaluación.")
+            propuesta = nueva
+    if not propuesta:
+        st.info("Define la propuesta objetivo del ejercicio para evaluar elegibilidad.")
+    else:
+        _resl = comparativo_estados(cli_id, mes_lic)
+        if not _resl or _resl[0] is None:
+            st.error("No se encontró la balanza de ese mes.")
+        else:
+            ev = licitacion_eval(_resl[0], propuesta)
+            edo = lambda ok: "Cumple" if ok else "No cumple"
+            vx = lambda v: "—" if v is None else "{:.2f}x".format(v)
+            pc = lambda v: "—" if v is None else "{:.1f}%".format(v * 100)
+            cnt_brecha = ev["cnt"] - ev["cnt_meta"]
+            acpc_b = (ev["ac_pc"] - LICIT_AC_PC) if ev["ac_pc"] is not None else None
+            atpt_b = (ev["at_pt"] - LICIT_AT_PT) if ev["at_pt"] is not None else None
+            ptat_b = (LICIT_PT_AT - ev["pt_at"]) if ev["pt_at"] is not None else None   # menor-mejor: signo invertido
+            filas = ["| Parámetro | Actual | Meta | Brecha | Estado |", "|---|--:|--:|--:|:--|",
+                     "| a) Capital neto de trabajo (AC − PC) | " + _fmt(ev["cnt"]) + " | " + _fmt(ev["cnt_meta"]) +
+                       " | " + _fmt(cnt_brecha) + " | " + edo(ev["a"]) + " |",
+                     "| b) Liquidez · AC / PC | " + vx(ev["ac_pc"]) + " | 1.10x | " +
+                       (vx(acpc_b) if acpc_b is not None else "—") + " | " +
+                       edo(ev["ac_pc"] is not None and ev["ac_pc"] >= LICIT_AC_PC) + " |",
+                     "| b) Solvencia · AT / PT | " + vx(ev["at_pt"]) + " | 2.00x | " +
+                       (vx(atpt_b) if atpt_b is not None else "—") + " | " +
+                       edo(ev["at_pt"] is not None and ev["at_pt"] >= LICIT_AT_PT) + " |",
+                     "| c) Endeudamiento · PT / AT | " + pc(ev["pt_at"]) + " | 70.0% | " +
+                       (("{:+.1f} pp".format(ptat_b * 100)) if ptat_b is not None else "—") + " | " +
+                       edo(ev["pt_at"] is not None and ev["pt_at"] <= LICIT_PT_AT) + " |"]
+            st.markdown("\n".join(filas))
+            if ev["elegible"]:
+                st.success("ELEGIBLE — cumple a) y al menos uno de b)/c).  Posición adelantada, no certificable.")
+            else:
+                faltan = []
+                if not ev["a"]: faltan.append("a) capital de trabajo")
+                if not ev["b"] and not ev["c"]: faltan.append("b) y c)")
+                st.error("NO ELEGIBLE — falla " + " · ".join(faltan) +
+                         ".  Regla: a AND (b OR c).  Calificación financiera del subrubro: cero.")
+            st.caption("Brecha firmada: negativa = falta para llegar a la meta (R-MET-02). "
+                       "Diagnóstico sobre la posición del mes; para clientes en recontabilización (Fase 0) "
+                       "las razones del balance no son certificables hasta cerrar (R-MET-06).")
  
