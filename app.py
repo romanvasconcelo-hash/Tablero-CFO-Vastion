@@ -1,4 +1,3 @@
-
 # ============================================================================
 # TABLERO CFO VASTION · App de Roberto  v0.3
 # Carga + validación + REPORTE INTERNO de indicadores.
@@ -680,6 +679,9 @@ def bg_rows_cmp(ef_a, ef_p):
         if abs(va) >= 1 or abs(vp) >= 1: rows.append((_lbl(g), va, vp, False))
     rows.append(('Resultado del ejercicio', ef_a['bg']['res'], (ef_p['bg']['res'] if ef_p else None), False))
     rows.append(('= Total capital', ef_a['bg']['tot_cap'], (ef_p['bg']['tot_cap'] if ef_p else None), True))
+    rows.append(('= Pasivo + Capital (debe igualar el activo)',
+                 ef_a['bg']['tot_pas'] + ef_a['bg']['tot_cap'],
+                 ((ef_p['bg']['tot_pas'] + ef_p['bg']['tot_cap']) if ef_p else None), True))
     return rows
  
 def efe_rows_cmp(ef_a, ef_p):
