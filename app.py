@@ -346,6 +346,57 @@ def _bmval(v, fmt):
     if fmt == "pct":  return "{:.1f}%".format(v*100)
     return "{:.2f}".format(v)
 
+CSF_CAMPOS = ["rfc","razon_social","nombre_comercial","regimen_capital","actividad_economica",
+              "actividad_pct","regimen_fiscal","fecha_inicio_ops","estatus","cp","municipio","entidad"]
+
+def parse_constancia(pdf_bytes):
+    """Extrae datos clave de una Constancia de Situacion Fiscal (SAT). Devuelve dict con CSF_CAMPOS."""
+    import pdfplumber, io, re
+    out = {k: "" for k in CSF_CAMPOS}
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        p1 = pdf.pages[0].extract_text(x_tolerance=1) or ""
+        p2 = pdf.pages[1].extract_text(x_tolerance=1) if len(pdf.pages) > 1 else ""
+    def g(pat, s, grp=1, flags=0):
+        m = re.search(pat, s, flags); return m.group(grp).strip() if m else ""
+    out["rfc"]              = g(r'RFC:\s*([A-Z0-9&\u00d1]{12,13})', p1)
+    out["razon_social"]     = g(r'Denominaci[o\u00f3]n/Raz[o\u00f3]n Social:\s*(.+)', p1)
+    out["regimen_capital"]  = g(r'R[e\u00e9]gimen Capital:\s*(.+)', p1)
+    out["nombre_comercial"] = g(r'Nombre Comercial:\s*(.+)', p1)
+    out["fecha_inicio_ops"] = g(r'Fecha inicio de operaciones:\s*(.+)', p1)
+    out["estatus"]          = g(r'Estatus en el padr[o\u00f3]n:\s*(.+)', p1)
+    out["cp"]               = g(r'C[o\u00f3]digo Postal:\s*(\d{5})', p1)
+    out["municipio"]        = g(r'Municipio o Demarcaci[o\u00f3]n Territorial:\s*(.+)', p1)
+    out["entidad"]          = g(r'Entidad Federativa:\s*(.+?)(?:\s+Entre Calle:|$)', p1)
+    out["actividad_economica"] = g(r'^\s*\d+\s+(.+?)\s+\d+\s+\d{2}/\d{2}/\d{4}', p2, flags=re.M)
+    out["actividad_pct"]       = g(r'^\s*\d+\s+.+?\s+(\d+)\s+\d{2}/\d{2}/\d{4}', p2, flags=re.M)
+    mreg = re.search(r'R[e\u00e9]gimen Fecha Inicio.*?\n(.+?)\s+\d{2}/\d{2}/\d{4}', p2, re.S)
+    out["regimen_fiscal"] = mreg.group(1).strip() if mreg else ""
+    return out
+
+def get_cliente_csf(cli):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT " + ",".join(CSF_CAMPOS) + " FROM cliente_csf WHERE cliente_id=%s", (cli,))
+        r = cur.fetchone()
+        return dict(zip(CSF_CAMPOS, r)) if r else None
+    except Exception:
+        return None
+    finally:
+        cur.close(); conn.close()
+
+def save_cliente_csf(cli, data):
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cols = ",".join(CSF_CAMPOS); ph = ",".join(["%s"] * len(CSF_CAMPOS))
+        upd = ",".join(c + "=EXCLUDED." + c for c in CSF_CAMPOS)
+        cur.execute("INSERT INTO cliente_csf (cliente_id," + cols + ",actualizado) "
+                    "VALUES (%s," + ph + ",now()) "
+                    "ON CONFLICT (cliente_id) DO UPDATE SET " + upd + ", actualizado=now()",
+                    [cli] + [(data.get(c) or "") for c in CSF_CAMPOS])
+        conn.commit()
+    finally:
+        cur.close(); conn.close()
+
 def _pdf_tabla_estado(pdf, t, Mg, CW, titulo, rows, ca, cp):
     dual = cp is not None
     if pdf.get_y() + 18 > 282: pdf.add_page()
@@ -398,22 +449,62 @@ def _pdf_tabla_ratios(pdf, t, Mg, CW, a_rows, p_rows, ca, cp):
     pdf.ln(3)
 
 def pdf_interno_2025(nombre, anio, serie, ef_cierre=None, dias_cierre=365, crecimiento=None,
-                     ef_cierre_prev=None, rat_now=None, rat_prev=None):
+                     ef_cierre_prev=None, rat_now=None, rat_prev=None, datos_cliente=None):
     """Reporte interno: modelo de negocio (cierre) + tendencia y resumen del ejercicio."""
     from fpdf import FPDF
     import io as _io
+    class _PDFInt(FPDF):
+        def footer(self):
+            self.set_y(-12); self.set_font("Helvetica","",7); self.set_text_color(150,150,150)
+            self.set_x(self.l_margin)
+            self.cell(0,5,"Confidencial - uso interno Vastion  |  Pagina " + str(self.page_no()),align="C")
     def t(s):
         return (str(s).replace("\u2014","-").replace("\u2013","-").replace("\u2212","-")
                 .replace("\u0394","Var. ")
                 .encode("latin-1","replace").decode("latin-1"))
     W, Mg = 210, 12; CW = W - 2*Mg
-    pdf = FPDF(orientation="P", unit="mm", format="A4"); pdf.set_auto_page_break(True, 15)
+    pdf = _PDFInt(orientation="P", unit="mm", format="A4"); pdf.set_auto_page_break(True, 15)
 
     def _band(titulo):
         yb = pdf.get_y()
         pdf.set_fill_color(28,45,58); pdf.rect(Mg,yb,CW,6,style="F")
         pdf.set_xy(Mg+1.5,yb+1); pdf.set_text_color(255,255,255); pdf.set_font("Helvetica","B",8.5)
         pdf.cell(CW-3,4,t(titulo)); pdf.set_y(yb+8)
+
+    # ===== Portada: Datos generales del cliente =====
+    if datos_cliente:
+        dc = datos_cliente
+        pdf.add_page()
+        pdf.set_fill_color(28,45,58); pdf.rect(0,0,W,56,style="F")
+        pdf.set_text_color(255,255,255); pdf.set_xy(Mg,15); pdf.set_font("Helvetica","B",11)
+        pdf.cell(CW,6,t("REPORTE CFO  -  USO INTERNO VASTION"))
+        pdf.set_xy(Mg,24); pdf.set_font("Helvetica","B",22)
+        pdf.multi_cell(CW,9,t(dc.get("razon_social") or nombre))
+        pdf.set_xy(Mg,46); pdf.set_font("Helvetica","",11)
+        pdf.cell(CW,6,t("Ejercicio " + str(anio)))
+        pdf.set_y(68)
+        def _fila(lbl, val):
+            if not val: return
+            yb = pdf.get_y()
+            pdf.set_x(Mg); pdf.set_text_color(127,140,141); pdf.set_font("Helvetica","B",9)
+            pdf.cell(52,6,t(lbl))
+            pdf.set_xy(Mg+52, yb); pdf.set_text_color(44,62,80); pdf.set_font("Helvetica","",10)
+            pdf.multi_cell(CW-52,6,t(val)); pdf.ln(2)
+        _fila("RFC", dc.get("rfc"))
+        _fila("Nombre comercial", dc.get("nombre_comercial"))
+        _fila("Régimen capital", dc.get("regimen_capital"))
+        _act = dc.get("actividad_economica") or ""
+        if dc.get("actividad_pct"): _act = (_act + "  (" + str(dc["actividad_pct"]) + "%)").strip()
+        _fila("Actividad económica", _act)
+        _fila("Régimen fiscal", dc.get("regimen_fiscal"))
+        _fila("Estatus en el padrón", dc.get("estatus"))
+        _fila("Inicio de operaciones", dc.get("fecha_inicio_ops"))
+        _dom = ", ".join([x for x in [dc.get("municipio"), dc.get("entidad"),
+                          ("C.P. " + dc["cp"]) if dc.get("cp") else ""] if x])
+        _fila("Domicilio fiscal", _dom)
+        pdf.ln(4); pdf.set_text_color(127,140,141); pdf.set_font("Helvetica","",7.5)
+        pdf.multi_cell(CW,3.6,t("Datos tomados de la Constancia de Situacion Fiscal del contribuyente. "
+                                "Documento de uso interno; no constituye opinion ni dictamen fiscal."))
 
     # ===== Pagina 1: Modelo de negocio (cierre del ejercicio) =====
     if ef_cierre is not None:
@@ -1244,6 +1335,45 @@ if not clientes:
 nombre_sel = st.selectbox("Cliente", [c[1] for c in clientes])
 cli_id = dict((c[1], c[0]) for c in clientes)[nombre_sel]
 
+with st.expander("Datos del cliente · Constancia de Situación Fiscal", expanded=False):
+    _saved_csf = get_cliente_csf(cli_id) or {}
+    if st.session_state.get("csf_cli") != cli_id:
+        for _k in CSF_CAMPOS:
+            st.session_state["csf_" + _k] = _saved_csf.get(_k, "") or ""
+        st.session_state["csf_cli"] = cli_id
+        st.session_state["csf_last"] = None
+    _csf_pdf = st.file_uploader("Sube la constancia (PDF) para autocompletar los campos", type=["pdf"], key="csf_up")
+    if _csf_pdf is not None and st.session_state.get("csf_last") != _csf_pdf.name:
+        try:
+            _ext = parse_constancia(_csf_pdf.getvalue())
+            for _k in CSF_CAMPOS:
+                if _ext.get(_k): st.session_state["csf_" + _k] = _ext[_k]
+            st.session_state["csf_last"] = _csf_pdf.name
+            st.success("Constancia leída. Revisa y corrige los campos antes de guardar.")
+        except Exception as e:
+            st.warning(f"No pude leer la constancia automáticamente ({e}). Captura los campos a mano.")
+    _ca, _cb = st.columns(2)
+    with _ca:
+        st.text_input("Razón social", key="csf_razon_social")
+        st.text_input("RFC", key="csf_rfc")
+        st.text_input("Nombre comercial", key="csf_nombre_comercial")
+        st.text_input("Régimen capital", key="csf_regimen_capital")
+        st.text_input("Actividad económica", key="csf_actividad_economica")
+        st.text_input("Porcentaje actividad", key="csf_actividad_pct")
+    with _cb:
+        st.text_input("Régimen fiscal", key="csf_regimen_fiscal")
+        st.text_input("Estatus en el padrón", key="csf_estatus")
+        st.text_input("Inicio de operaciones", key="csf_fecha_inicio_ops")
+        st.text_input("Código postal", key="csf_cp")
+        st.text_input("Municipio", key="csf_municipio")
+        st.text_input("Entidad federativa", key="csf_entidad")
+    if st.button("Guardar datos del cliente"):
+        try:
+            save_cliente_csf(cli_id, {_k: st.session_state.get("csf_" + _k, "") for _k in CSF_CAMPOS})
+            st.success("Datos del cliente guardados.")
+        except Exception as e:
+            st.error(f"No se pudieron guardar (¿corriste cliente_csf.sql en Supabase?). {e}")
+
 st.markdown("**Suelta aquí los archivos del mes** (balanza XML obligatoria; catálogo XML la primera vez; CFDI emitidos y recibidos):")
 subidos = st.file_uploader("Arrastra los archivos", accept_multiple_files=True,
                            type=['xml','xlsx'], label_visibility='collapsed')
@@ -1667,7 +1797,8 @@ else:
                 try:
                     _pdfint = pdf_interno_2025(nombre_sel, anio_int, serie,
                                                ef_cierre=_efc, dias_cierre=_diasc, crecimiento=_crec,
-                                               ef_cierre_prev=_efp, rat_now=_rn, rat_prev=_rp)
+                                               ef_cierre_prev=_efp, rat_now=_rn, rat_prev=_rp,
+                                               datos_cliente=get_cliente_csf(cli_id))
                     st.download_button("📄 Descargar reporte interno", data=_pdfint,
                                        file_name="Reporte_Interno_" + nombre_sel.replace(" ", "_") + "_" + str(anio_int) + ".pdf",
                                        mime="application/pdf", key="int_dl")
