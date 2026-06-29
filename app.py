@@ -221,7 +221,7 @@ def _efe_diag(efe):
 # ---------------------------------------------------------------------------
 # Spec unica: alimenta la grafica y la tabla resumen (DRY). meta y dir solo en anclas duras.
 SERIE_SPEC = [
-    ("Rentabilidad (Pre-Tax %)", "pretax", "pct",     10.0, "mayor"),   # Crabtree
+    ("Rentabilidad (antes de impuestos) %", "pretax", "pct",     10.0, "mayor"),   # Crabtree
     ("Margen bruto %",           "mb",     "pct",     None, None),       # segun sector
     ("Liquidez (AC / PC)",       "ac_pc",  "x",       1.1,  "mayor"),    # licitacion
     ("Capital de trabajo",       "cnt",    "money",   0.0,  "mayor"),    # piso: positivo
@@ -320,22 +320,23 @@ def modelo_negocio(ef, dias):
         ("= Margen bruto", y["ub"], sd(y["ub"], ing)),
         ("(-) Gastos de operacion", y["gas"], sd(y["gas"], ing)),
         ("(-) Depreciacion", y["dep"], sd(y["dep"], ing)),
-        ("= Utilidad de operacion (EBIT)", y["ebit"], sd(y["ebit"], ing)),
+        ("= Utilidad de operacion", y["ebit"], sd(y["ebit"], ing)),
         ("(-) Resultado financiero neto", y["fin"], sd(y["fin"], ing)),
         ("(-) ISR provisional", isr, sd(isr, ing)),
         ("= Utilidad neta", un, sd(un, ing)),
     ]
     dso = sd(s["cxc"], ing); dio = sd(s["inv"], y["cos"])
     asset = [
-        ("Dias cuentas por cobrar (DSO)", (dso*dias if dso is not None else None), "dias"),
-        ("Dias de inventario (DIO)", (dio*dias if dio is not None else None), "dias"),
+        ("Dias cuentas por cobrar", (dso*dias if dso is not None else None), "dias"),
+        ("Dias de inventario", (dio*dias if dio is not None else None), "dias"),
         ("Rotacion de capital operativo", sd(ing, ef["cash"]["opcap"]), "x"),
         ("Rotacion de activo fijo", sd(ing, s["afn"]), "x"),
         ("Rotacion de activo total", sd(ing, s["activo"]), "x"),
+        ("Cobertura de intereses", sd(y["ebit"], y["fin"]), "x"),
     ]
     lev = [("Deuda / Capital total", sd(s["pasivo"], s["pasivo"]+s["capital"]), "pct")]
-    ret = [("ROE (Utilidad neta / Capital)", sd(un, s["capital"]), "pct"),
-           ("ROIC (EBIT / Capital empleado)", sd(y["ebit"], s["activo"]-s["pas_circ"]), "pct")]
+    ret = [("Rendimiento sobre capital", sd(un, s["capital"]), "pct"),
+           ("Rendimiento sobre capital empleado", sd(y["ebit"], s["activo"]-s["pas_circ"]), "pct")]
     return dict(prof=prof, asset=asset, lev=lev, ret=ret)
 
 def _bmval(v, fmt):
@@ -346,24 +347,66 @@ def _bmval(v, fmt):
     return "{:.2f}".format(v)
 
 def pdf_interno_2025(nombre, anio, serie, ef_cierre=None, dias_cierre=365, crecimiento=None):
-    """Reporte interno: header + grafica de tendencia + tabla resumen (apertura/cierre/promedio)."""
+    """Reporte interno: modelo de negocio (cierre) + tendencia y resumen del ejercicio."""
     from fpdf import FPDF
     import io as _io
     def t(s):
         return (str(s).replace("\u2014","-").replace("\u2013","-").replace("\u2212","-")
                 .encode("latin-1","replace").decode("latin-1"))
     W, Mg = 210, 12; CW = W - 2*Mg
-    pdf = FPDF(orientation="P", unit="mm", format="A4"); pdf.set_auto_page_break(True, 15); pdf.add_page()
+    pdf = FPDF(orientation="P", unit="mm", format="A4"); pdf.set_auto_page_break(True, 15)
+
+    def _band(titulo):
+        yb = pdf.get_y()
+        pdf.set_fill_color(28,45,58); pdf.rect(Mg,yb,CW,6,style="F")
+        pdf.set_xy(Mg+1.5,yb+1); pdf.set_text_color(255,255,255); pdf.set_font("Helvetica","B",8.5)
+        pdf.cell(CW-3,4,t(titulo)); pdf.set_y(yb+8)
+
+    # ===== Pagina 1: Modelo de negocio (cierre del ejercicio) =====
+    if ef_cierre is not None:
+        mn = modelo_negocio(ef_cierre, dias_cierre)
+        pdf.add_page()
+        pdf.set_fill_color(28,45,58); pdf.rect(0,0,W,22,style="F")
+        pdf.set_text_color(255,255,255); pdf.set_xy(Mg,5); pdf.set_font("Helvetica","B",14)
+        pdf.cell(CW,7,t("Modelo de negocio - cierre " + str(anio)))
+        pdf.set_xy(Mg,13); pdf.set_font("Helvetica","",9)
+        pdf.cell(CW,5,t("Como gana dinero el negocio: rentabilidad, uso de activos, apalancamiento y rendimientos."))
+        pdf.set_y(27)
+        if crecimiento is not None:
+            pdf.set_x(Mg); pdf.set_text_color(44,62,80); pdf.set_font("Helvetica","",9)
+            pdf.cell(CW,6,t("Crecimiento de ventas vs ejercicio anterior: {:+.1f}%".format(crecimiento*100))); pdf.ln(8)
+        _band("RENTABILIDAD  (estado de resultados de gestion)")
+        pdf.set_x(Mg); pdf.set_text_color(127,140,141); pdf.set_font("Helvetica","B",7.5)
+        pdf.cell(96,5,t("Concepto")); pdf.cell(50,5,t("Monto"),align="R"); pdf.cell(CW-146,5,t("% ventas"),align="R"); pdf.ln(5)
+        for lbl, monto, pct in mn["prof"]:
+            bold = lbl.startswith("=")
+            pdf.set_x(Mg); pdf.set_text_color(44,62,80); pdf.set_font("Helvetica","B" if bold else "",8)
+            pdf.cell(96,5,t(lbl)); pdf.cell(50,5,t(_fmt(monto)),align="R")
+            pdf.cell(CW-146,5,t("{:.1f}%".format(pct*100) if pct is not None else "-"),align="R"); pdf.ln(5)
+        pdf.ln(2)
+        for titulo, rows in [("USO DE ACTIVOS", mn["asset"]),
+                             ("APALANCAMIENTO", mn["lev"]),
+                             ("RENDIMIENTOS", mn["ret"])]:
+            _band(titulo)
+            for lbl, val, fmt in rows:
+                pdf.set_x(Mg); pdf.set_text_color(44,62,80); pdf.set_font("Helvetica","",8)
+                pdf.cell(120,5,t(lbl)); pdf.cell(CW-120,5,t(_bmval(val,fmt)),align="R"); pdf.ln(5)
+            pdf.ln(2)
+        pdf.set_text_color(127,140,141); pdf.set_font("Helvetica","",7.5)
+        pdf.multi_cell(CW,3.6,t("Estructura del modelo de negocio poblada con los indicadores del sistema al cierre del "
+                                "ejercicio. El modelo explica como esta armado el negocio (margen, rotacion y apalancamiento); "
+                                "las metas vienen de fuentes externas, no de esta vista."))
+
+    # ===== Pagina: Comportamiento del ejercicio (tendencia + resumen) =====
+    pdf.add_page()
     pdf.set_fill_color(28,45,58); pdf.rect(0,0,W,26,style="F")
     pdf.set_text_color(255,255,255); pdf.set_xy(Mg,7); pdf.set_font("Helvetica","B",16)
     pdf.cell(CW,8,t("Reporte interno - Comportamiento " + str(anio)))
     pdf.set_xy(Mg,16); pdf.set_font("Helvetica","",10)
-    pdf.cell(CW,6,t(nombre + "   |   uso interno Vastion   |   acumulado del ejercicio (YTD)"))
-    # grafica
+    pdf.cell(CW,6,t(nombre + "   |   uso interno Vastion   |   acumulado del ejercicio"))
     png = _fig_tendencia(serie)
     pdf.image(_io.BytesIO(png), x=Mg, y=31, w=CW)
     yt = 31 + CW*6.0/11.0 + 6
-    # tabla resumen
     pdf.set_xy(Mg, yt); pdf.set_text_color(44,62,80); pdf.set_font("Helvetica","B",12)
     pdf.cell(CW,7,t("Resumen del ejercicio")); pdf.ln(9)
     pdf.set_x(Mg); pdf.set_text_color(127,140,141); pdf.set_font("Helvetica","B",8)
@@ -391,48 +434,8 @@ def pdf_interno_2025(nombre, anio, serie, ef_cierre=None, dias_cierre=365, creci
         pdf.cell(26,5.5,t(edo),align="R"); pdf.ln(5.5)
     pdf.ln(3); pdf.set_text_color(127,140,141); pdf.set_font("Helvetica","",7.5)
     pdf.multi_cell(CW,3.6,t("Apertura = primer mes cargado; Cierre = ultimo mes; Promedio = media de los meses. "
-                            "Metas: Pre-Tax 10% y liquidez/endeudamiento por parametros de licitacion federal. "
+                            "Metas: rentabilidad 10% y liquidez/endeudamiento por parametros de licitacion federal. "
                             "Para clientes en recontabilizacion (Fase 0) la serie es diagnostico, no linea base valida (R-MET-06)."))
-
-    # ===== Pagina: Modelo de Negocio (Alexander, Tabla 3.10) =====
-    if ef_cierre is not None:
-        mn = modelo_negocio(ef_cierre, dias_cierre)
-        pdf.add_page()
-        pdf.set_fill_color(28,45,58); pdf.rect(0,0,W,22,style="F")
-        pdf.set_text_color(255,255,255); pdf.set_xy(Mg,5); pdf.set_font("Helvetica","B",14)
-        pdf.cell(CW,7,t("Modelo de negocio (Alexander) - cierre " + str(anio)))
-        pdf.set_xy(Mg,13); pdf.set_font("Helvetica","",9)
-        pdf.cell(CW,5,t("Como gana dinero el negocio: rentabilidad, uso de activos, apalancamiento y retornos."))
-        pdf.set_y(27)
-        if crecimiento is not None:
-            pdf.set_x(Mg); pdf.set_text_color(44,62,80); pdf.set_font("Helvetica","",9)
-            pdf.cell(CW,6,t("Crecimiento de ventas vs ejercicio anterior: {:+.1f}%".format(crecimiento*100))); pdf.ln(8)
-        def _band(titulo):
-            yb = pdf.get_y()
-            pdf.set_fill_color(28,45,58); pdf.rect(Mg,yb,CW,6,style="F")
-            pdf.set_xy(Mg+1.5,yb+1); pdf.set_text_color(255,255,255); pdf.set_font("Helvetica","B",8.5)
-            pdf.cell(CW-3,4,t(titulo)); pdf.set_y(yb+8)
-        _band("PROFITABILITY MODEL  (rentabilidad, P&L de gestion)")
-        pdf.set_x(Mg); pdf.set_text_color(127,140,141); pdf.set_font("Helvetica","B",7.5)
-        pdf.cell(96,5,t("Concepto")); pdf.cell(50,5,t("Monto"),align="R"); pdf.cell(CW-146,5,t("% ventas"),align="R"); pdf.ln(5)
-        for lbl, monto, pct in mn["prof"]:
-            bold = lbl.startswith("=")
-            pdf.set_x(Mg); pdf.set_text_color(44,62,80); pdf.set_font("Helvetica","B" if bold else "",8)
-            pdf.cell(96,5,t(lbl)); pdf.cell(50,5,t(_fmt(monto)),align="R")
-            pdf.cell(CW-146,5,t("{:.1f}%".format(pct*100) if pct is not None else "-"),align="R"); pdf.ln(5)
-        pdf.ln(2)
-        for titulo, rows in [("ASSET UTILIZATION  (uso de activos)", mn["asset"]),
-                             ("LEVERAGE  (apalancamiento)", mn["lev"]),
-                             ("RETURNS  (retornos)", mn["ret"])]:
-            _band(titulo)
-            for lbl, val, fmt in rows:
-                pdf.set_x(Mg); pdf.set_text_color(44,62,80); pdf.set_font("Helvetica","",8)
-                pdf.cell(120,5,t(lbl)); pdf.cell(CW-120,5,t(_bmval(val,fmt)),align="R"); pdf.ln(5)
-            pdf.ln(2)
-        pdf.set_text_color(127,140,141); pdf.set_font("Helvetica","",7.5)
-        pdf.multi_cell(CW,3.6,t("Estructura del modelo de negocio segun Alexander (Tabla 3.10), poblada con los indicadores "
-                                "del sistema al cierre del ejercicio. El modelo explica la estructura (margen x rotacion x "
-                                "apalancamiento -> ROIC); las metas vienen de fuentes externas, no de esta tabla."))
     return bytes(pdf.output())
 
 
