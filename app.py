@@ -740,7 +740,8 @@ def _metas_cliente_rows(ind, metas):
     return rows
 
 def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per_p=None, rat=None,
-                        numero_mes=None, acciones=None, valor_generado=None, metas=None, poder_uno=None):
+                        numero_mes=None, acciones=None, valor_generado=None, metas=None, poder_uno=None,
+                        branding=None):
     """Reporte CFO mensual del cliente. Base YTD (acumulado). Caja al centro (regla de hierro)."""
     from fpdf import FPDF
     class _PDFCli(FPDF):
@@ -756,35 +757,53 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
     W, Mg = 210, 16; CW = W - 2 * Mg
     pdf = _PDFCli(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=16)
+    import io as _io
+    _br = branding or {}
+    _PRIM = _hex_rgb(_br.get("color_primario"), (28, 45, 58))
+    _ACC = _hex_rgb(_br.get("color_acento"), (46, 134, 171))
+    _GRY = (120, 120, 120); _INK = (40, 40, 40)
+    _logo = _br.get("logo")
+
+    def _hcli(titulo, sub=None, big=False):
+        """Cabecera minimalista: logo + titulo en primario + linea de acento. Sin barra rellena."""
+        if _logo:
+            try:
+                pdf.image(_io.BytesIO(_logo), x=W - Mg - 30, y=10, h=13)
+            except Exception:
+                pass
+        pdf.set_xy(Mg, 14); pdf.set_text_color(*_PRIM); pdf.set_font("Helvetica", "B", 19 if big else 16)
+        pdf.cell(CW - 34, 9, t(titulo))
+        _yl = 25
+        if sub:
+            pdf.set_xy(Mg, 24); pdf.set_text_color(*_GRY); pdf.set_font("Helvetica", "", 11); pdf.cell(CW, 6, t(sub))
+            _yl = 33
+        pdf.set_draw_color(*_ACC); pdf.set_line_width(0.6); pdf.line(Mg, _yl, W - Mg, _yl); pdf.set_line_width(0.2)
+        return _yl
+
 
     # ===================== HOJA 1: el mes en una hoja =====================
     pdf.add_page()
-    pdf.set_fill_color(28, 45, 58); pdf.rect(0, 0, W, 30, style="F")
-    pdf.set_text_color(255, 255, 255)
-    pdf.set_xy(Mg, 8);  pdf.set_font("Helvetica", "B", 18); pdf.cell(CW, 8, t("Reporte CFO Mensual"))
-    pdf.set_xy(Mg, 18); pdf.set_font("Helvetica", "", 11); pdf.cell(CW, 6, t(nombre + "   |   " + periodo))
+    _hcli("Reporte CFO Mensual", nombre + "   ·   " + periodo, big=True)
 
-    pdf.set_text_color(44, 62, 80)
-    pdf.set_xy(Mg, 40); pdf.set_font("Helvetica", "", 11); pdf.cell(CW, 6, t("Tu caja al cierre del mes"))
-    pdf.set_xy(Mg, 47); pdf.set_font("Helvetica", "B", 30); pdf.cell(CW, 14, t(m(ind.get("caja"))))
+    pdf.set_xy(Mg, 42); pdf.set_text_color(*_GRY); pdf.set_font("Helvetica", "", 11); pdf.cell(CW, 6, t("Tu caja al cierre del mes"))
+    pdf.set_xy(Mg, 49); pdf.set_text_color(*_PRIM); pdf.set_font("Helvetica", "B", 32); pdf.cell(CW, 14, t(m(ind.get("caja"))))
     cv = ind.get("caja_var")
-    pdf.set_xy(Mg, 63); pdf.set_font("Helvetica", "", 11)
+    pdf.set_xy(Mg, 65); pdf.set_font("Helvetica", "", 11)
     if cv is not None:
         if cv < 0: pdf.set_text_color(192, 57, 43); _tx = "Bajo " + m(abs(cv)) + " respecto al mes anterior"
         else:      pdf.set_text_color(39, 174, 96); _tx = "Subio " + m(abs(cv)) + " respecto al mes anterior"
         pdf.cell(CW, 6, t(_tx))
     else:
-        pdf.set_text_color(127, 140, 141); pdf.cell(CW, 6, t("Sin mes anterior para comparar"))
+        pdf.set_text_color(*_GRY); pdf.cell(CW, 6, t("Sin mes anterior para comparar"))
 
-    yNum = 72
+    yNum = 75
     if numero_mes and numero_mes.strip():
-        pdf.set_draw_color(220, 223, 227); pdf.set_fill_color(248, 249, 250); pdf.rect(Mg, yNum, CW, 15, style="DF")
-        pdf.set_fill_color(28, 45, 58); pdf.rect(Mg, yNum, 2.5, 15, style="F")
-        pdf.set_xy(Mg + 5, yNum + 2.5); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 8.5)
+        pdf.set_draw_color(*_ACC); pdf.set_line_width(0.8); pdf.line(Mg, yNum, Mg, yNum + 13); pdf.set_line_width(0.2)
+        pdf.set_xy(Mg + 5, yNum); pdf.set_text_color(*_GRY); pdf.set_font("Helvetica", "", 8.5)
         pdf.cell(CW - 8, 4, t("El numero mas importante del mes"))
-        pdf.set_xy(Mg + 5, yNum + 7.5); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B", 11)
+        pdf.set_xy(Mg + 5, yNum + 5); pdf.set_text_color(*_PRIM); pdf.set_font("Helvetica", "B", 11)
         pdf.multi_cell(CW - 8, 5, t(numero_mes.strip()))
-        y0 = yNum + 21
+        y0 = yNum + 20
     else:
         y0 = yNum
 
@@ -801,46 +820,44 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
     elif cl > 0:                    c_cl, n_cl = (192, 57, 43),  "La utilidad no llego a caja"
     else:                           c_cl, n_cl = (39, 174, 96),  "La caja siguio a la utilidad"
 
-    def card(x, y, w, h, titulo, valor, color, nota):
-        pdf.set_draw_color(220, 223, 227); pdf.set_fill_color(248, 249, 250); pdf.rect(x, y, w, h, style="DF")
-        pdf.set_fill_color(*color); pdf.rect(x, y, w, 2.5, style="F")
-        pdf.set_xy(x + 3, y + 5);  pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 8.5); pdf.multi_cell(w - 6, 4, t(titulo))
-        pdf.set_xy(x + 3, y + 13); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B", 16); pdf.cell(w - 6, 8, t(valor))
-        pdf.set_xy(x + 3, y + 23); pdf.set_text_color(*color); pdf.set_font("Helvetica", "", 8); pdf.multi_cell(w - 6, 4, t(nota))
+    def card(x, y, w, titulo, valor, color, nota, neutro=False):
+        # Minimalista: solo linea superior (semaforo) + texto. Sin relleno ni borde.
+        _ln = (205, 208, 212) if neutro else color
+        pdf.set_draw_color(*_ln); pdf.set_line_width(0.8); pdf.line(x, y, x + w, y); pdf.set_line_width(0.2)
+        pdf.set_xy(x, y + 3.5);  pdf.set_text_color(*_GRY); pdf.set_font("Helvetica", "", 8.5); pdf.multi_cell(w, 4, t(titulo))
+        pdf.set_xy(x, y + 12); pdf.set_text_color(*_INK); pdf.set_font("Helvetica", "B", 16); pdf.cell(w, 8, t(valor))
+        pdf.set_xy(x, y + 21); pdf.set_text_color(*(_GRY if neutro else color)); pdf.set_font("Helvetica", "", 8); pdf.multi_cell(w, 4, t(nota))
 
-    gap = 4; cw = (CW - 2 * gap) / 3
-    card(Mg,                y0, cw, 32, "Rentabilidad del ano (acumulada)", v_rent, c_rent,     n_rent)
-    card(Mg + cw + gap,     y0, cw, 32, "Margen de tu operacion",           v_mb,   (52, 73, 94), "Acumulado del ano")
-    card(Mg + 2*(cw + gap), y0, cw, 32, "Brecha utilidad vs. caja",         m(cl),  c_cl,        n_cl)
+    gap = 5; cw = (CW - 2 * gap) / 3
+    card(Mg,                y0, cw, "Rentabilidad del ano (acumulada)", v_rent, c_rent, n_rent)
+    card(Mg + cw + gap,     y0, cw, "Margen de tu operacion",           v_mb,   _PRIM,  "Acumulado del ano", neutro=True)
+    card(Mg + 2*(cw + gap), y0, cw, "Brecha utilidad vs. caja",         m(cl),  c_cl,   n_cl)
 
-    yN = y0 + 32 + 8
-    pdf.set_xy(Mg, yN); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B", 12); pdf.cell(CW, 7, t("Lo que esto significa"))
-    hbox = 278 - (yN + 9)
-    if hbox < 30: hbox = 30
-    pdf.set_draw_color(220, 223, 227); pdf.set_fill_color(252, 252, 253); pdf.rect(Mg, yN + 9, CW, hbox, style="DF")
-    pdf.set_xy(Mg + 3, yN + 12); pdf.set_font("Helvetica", "", 10.5); pdf.set_text_color(44, 62, 80)
+    yN = y0 + 32 + 6
+    pdf.set_xy(Mg, yN); pdf.set_text_color(*_PRIM); pdf.set_font("Helvetica", "B", 12); pdf.cell(CW, 7, t("Lo que esto significa"))
+    pdf.set_draw_color(*_ACC); pdf.set_line_width(0.8); pdf.line(Mg, yN + 9, Mg, 274); pdf.set_line_width(0.2)
+    pdf.set_xy(Mg + 5, yN + 10); pdf.set_font("Helvetica", "", 10.5); pdf.set_text_color(*_INK)
     _txt = lectura.strip() if (lectura and lectura.strip()) else "(La lectura del mes la escribe el CFO antes de enviar el reporte al cliente.)"
-    pdf.multi_cell(CW - 6, 5.5, t(_txt))
+    pdf.multi_cell(CW - 8, 5.5, t(_txt))
 
     # ===================== HOJA 2: que hacer =====================
     pdf.add_page()
-    pdf.set_fill_color(28, 45, 58); pdf.rect(0, 0, W, 22, style="F")
-    pdf.set_text_color(255, 255, 255); pdf.set_xy(Mg, 6); pdf.set_font("Helvetica", "B", 15); pdf.cell(CW, 8, t("Que hacer este mes"))
-    pdf.set_y(30)
-    pdf.set_x(Mg); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B", 12); pdf.cell(CW, 7, t("Las 3 acciones del mes")); pdf.ln(9)
+    _hcli("Que hacer este mes")
+    pdf.set_y(32)
+    pdf.set_x(Mg); pdf.set_text_color(*_PRIM); pdf.set_font("Helvetica", "B", 12); pdf.cell(CW, 7, t("Las 3 acciones del mes")); pdf.ln(9)
     _acc = [a.strip() for a in (acciones or "").split("\n") if a.strip()][:3]
     if not _acc:
-        pdf.set_x(Mg); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 10)
+        pdf.set_x(Mg); pdf.set_text_color(*_GRY); pdf.set_font("Helvetica", "", 10)
         pdf.multi_cell(CW, 5.5, t("(El CFO escribe aqui las 3 acciones concretas del mes, una por linea.)")); pdf.ln(2)
     else:
         for i, a in enumerate(_acc, 1):
             yb = pdf.get_y()
-            pdf.set_fill_color(28, 45, 58); pdf.set_text_color(255, 255, 255); pdf.set_font("Helvetica", "B", 11)
+            pdf.set_fill_color(*_PRIM); pdf.set_text_color(255, 255, 255); pdf.set_font("Helvetica", "B", 11)
             pdf.set_xy(Mg, yb); pdf.cell(8, 8, t(str(i)), align="C", fill=True)
-            pdf.set_xy(Mg + 12, yb); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "", 10.5)
+            pdf.set_xy(Mg + 12, yb); pdf.set_text_color(*_INK); pdf.set_font("Helvetica", "", 10.5)
             pdf.multi_cell(CW - 12, 5.5, t(a)); pdf.ln(3)
-    pdf.ln(2); pdf.set_x(Mg); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B", 12); pdf.cell(CW, 7, t("Tus metas")); pdf.ln(9)
-    pdf.set_x(Mg); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "B", 8)
+    pdf.ln(2); pdf.set_x(Mg); pdf.set_text_color(*_PRIM); pdf.set_font("Helvetica", "B", 12); pdf.cell(CW, 7, t("Tus metas")); pdf.ln(9)
+    pdf.set_x(Mg); pdf.set_text_color(*_GRY); pdf.set_font("Helvetica", "B", 8)
     pdf.cell(82, 6, t("Indicador")); pdf.cell(32, 6, t("Hoy"), align="R"); pdf.cell(32, 6, t("Meta"), align="R"); pdf.cell(CW - 146, 6, t("Estado"), align="R"); pdf.ln(6)
     _fm = _metas_cliente_rows(ind, metas)
     if not _fm:
@@ -860,47 +877,46 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
         def _sgn(v):
             return ("+" if v >= 0 else "-") + money(abs(v))
         pdf.add_page()
-        pdf.set_fill_color(28, 45, 58); pdf.rect(0, 0, W, 22, style="F")
-        pdf.set_text_color(255, 255, 255); pdf.set_xy(Mg, 6); pdf.set_font("Helvetica", "B", 15); pdf.cell(CW, 8, t("Las palancas de tu negocio"))
-        pdf.set_y(28)
-        pdf.set_x(Mg); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 9)
+        _hcli("Las palancas de tu negocio")
+        pdf.set_y(30)
+        pdf.set_x(Mg); pdf.set_text_color(*_GRY); pdf.set_font("Helvetica", "", 9)
         pdf.multi_cell(CW, 4.5, t("Cuanto cambia tu utilidad o tu caja si mueves cada palanca (base: " + _tlbl + ")."))
         pdf.ln(3)
-        pdf.set_x(Mg); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "B", 8)
+        pdf.set_x(Mg); pdf.set_text_color(*_GRY); pdf.set_font("Helvetica", "B", 8)
         pdf.cell(72, 6, t("Palanca")); pdf.cell(34, 6, t("Movimiento"), align="R"); pdf.cell(42, 6, t("Efecto"), align="R"); pdf.cell(CW - 148, 6, t("Sobre"), align="R"); pdf.ln(6)
         for nom, mov, imp, k in pu["filas"]:
-            pdf.set_x(Mg); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "", 9)
+            pdf.set_x(Mg); pdf.set_text_color(*_INK); pdf.set_font("Helvetica", "", 9)
             pdf.cell(72, 6, t(nom)); pdf.cell(34, 6, t(mov), align="R")
             if imp > 0: pdf.set_text_color(39, 174, 96)
             elif imp < 0: pdf.set_text_color(192, 57, 43)
-            else: pdf.set_text_color(127, 140, 141)
+            else: pdf.set_text_color(*_GRY)
             pdf.cell(42, 6, t(_sgn(imp)), align="R")
-            pdf.set_text_color(127, 140, 141); pdf.cell(CW - 148, 6, t(k), align="R"); pdf.ln(6)
+            pdf.set_text_color(*_GRY); pdf.cell(CW - 148, 6, t(k), align="R"); pdf.ln(6)
         pdf.ln(3)
         if pu.get("trampa"):
-            yb = pdf.get_y(); pdf.set_fill_color(253, 235, 233); pdf.set_draw_color(192, 57, 43); pdf.rect(Mg, yb, CW, 15, style="DF")
-            pdf.set_xy(Mg + 3, yb + 2.5); pdf.set_text_color(192, 57, 43); pdf.set_font("Helvetica", "B", 9)
+            yb = pdf.get_y()
+            pdf.set_draw_color(192, 57, 43); pdf.set_line_width(0.8); pdf.line(Mg, yb, Mg, yb + 13); pdf.set_line_width(0.2)
+            pdf.set_xy(Mg + 4, yb); pdf.set_text_color(192, 57, 43); pdf.set_font("Helvetica", "B", 9)
             pdf.multi_cell(CW - 6, 4.5, t("Cuidado: con tu margen actual, vender mas volumen REDUCE la utilidad. "
                                           "Primero se arregla el margen, despues se busca vender mas."))
-            pdf.set_y(yb + 18)
-        pdf.set_x(Mg); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "B", 11); pdf.cell(CW, 7, t("Si mueves todas las palancas juntas:")); pdf.ln(9)
+            pdf.set_y(yb + 16)
+        pdf.set_x(Mg); pdf.set_text_color(*_PRIM); pdf.set_font("Helvetica", "B", 11); pdf.cell(CW, 7, t("Si mueves todas las palancas juntas:")); pdf.ln(9)
         for _lbl, _v in [("Cambio en tu utilidad", pu.get("du", 0)), ("Cambio en tu caja", pu.get("dc", 0))]:
-            pdf.set_x(Mg); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "", 10.5); pdf.cell(72, 8, t(_lbl))
+            pdf.set_x(Mg); pdf.set_text_color(*_INK); pdf.set_font("Helvetica", "", 10.5); pdf.cell(72, 8, t(_lbl))
             if _v > 0: pdf.set_text_color(39, 174, 96)
             elif _v < 0: pdf.set_text_color(192, 57, 43)
-            else: pdf.set_text_color(127, 140, 141)
+            else: pdf.set_text_color(*_GRY)
             pdf.set_font("Helvetica", "B", 13); pdf.cell(CW - 72, 8, t(_sgn(_v))); pdf.ln(9)
 
     # ===================== HOJA 3: valor generado =====================
     pdf.add_page()
-    pdf.set_fill_color(28, 45, 58); pdf.rect(0, 0, W, 22, style="F")
-    pdf.set_text_color(255, 255, 255); pdf.set_xy(Mg, 6); pdf.set_font("Helvetica", "B", 15); pdf.cell(CW, 8, t("Valor generado"))
+    _hcli("Valor generado")
     pdf.set_y(34)
     if valor_generado and valor_generado.strip():
-        pdf.set_x(Mg); pdf.set_text_color(44, 62, 80); pdf.set_font("Helvetica", "", 11)
+        pdf.set_x(Mg); pdf.set_text_color(*_INK); pdf.set_font("Helvetica", "", 11)
         pdf.multi_cell(CW, 6, t(valor_generado.strip()))
     else:
-        pdf.set_x(Mg); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 10.5)
+        pdf.set_x(Mg); pdf.set_text_color(*_GRY); pdf.set_font("Helvetica", "", 10.5)
         pdf.multi_cell(CW, 5.5, t("(El CFO documenta aqui el valor generado por Vastion en el mes, en pesos: impuestos "
                                   "ahorrados, IVA recuperado, contingencias evitadas, ahorro financiero. Incluir el "
                                   "acumulado: 'Desde que Vastion es tu CFO hemos generado $X en valor documentado.')"))
@@ -913,7 +929,7 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
         lab = label if len(str(label)) <= 50 else (str(label)[:48] + "..")
         pdf.set_x(Mg)
         if header:
-            pdf.set_fill_color(28, 45, 58); pdf.set_text_color(255, 255, 255); pdf.set_font("Helvetica", "B", 9)
+            pdf.set_fill_color(*_PRIM); pdf.set_text_color(255, 255, 255); pdf.set_font("Helvetica", "B", 9)
             pdf.cell(CW, 6, t(" " + lab), fill=True); pdf.ln(7); return
         if sa is None and sp is None and sv is None:
             pdf.set_fill_color(238, 240, 242); pdf.set_text_color(80, 90, 100); pdf.set_font("Helvetica", "B", 8)
@@ -951,10 +967,10 @@ def pdf_reporte_cliente(nombre, periodo, ind, lectura, ef_a=None, ef_p=None, per
 
     def _banner_anexo(titulo, nota):
         pdf.add_page()
-        pdf.set_fill_color(28, 45, 58); pdf.rect(0, 0, W, 16, style="F")
-        pdf.set_xy(Mg, 4); pdf.set_text_color(255, 255, 255); pdf.set_font("Helvetica", "B", 12)
+        pdf.set_xy(Mg, 14); pdf.set_text_color(*_PRIM); pdf.set_font("Helvetica", "B", 13)
         pdf.cell(CW, 8, t(titulo))
-        pdf.set_xy(Mg, 20); pdf.set_text_color(127, 140, 141); pdf.set_font("Helvetica", "", 7.5)
+        pdf.set_draw_color(*_ACC); pdf.set_line_width(0.6); pdf.line(Mg, 24, W - Mg, 24); pdf.set_line_width(0.2)
+        pdf.set_xy(Mg, 27); pdf.set_text_color(*_GRY); pdf.set_font("Helvetica", "", 7.5)
         pdf.multi_cell(CW, 4, t(nota)); pdf.ln(2)
 
     cp_lbl = (per_p[:7] if per_p else None)
@@ -2349,7 +2365,7 @@ else:
                                                numero_mes=st.session_state.get("rep_numero", ""),
                                                acciones=st.session_state.get("rep_acciones", ""),
                                                valor_generado=st.session_state.get("rep_valor", ""),
-                                               metas=_metas_c, poder_uno=_pu)
+                                               metas=_metas_c, poder_uno=_pu, branding=get_branding(cli_id))
                     st.download_button("📄 Descargar PDF para el cliente", data=_pdf,
                                        file_name="Reporte_CFO_" + nombre_sel.replace(" ", "_") + "_" + mes_rep[:7] + ".pdf",
                                        mime="application/pdf", key="rep_pdf_dl")
