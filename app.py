@@ -130,6 +130,24 @@ def cargar_auxiliares(cli, lista):
     finally:
         cur.close(); conn.close()
 
+def cargar_cfdi(cli, lista):
+    """Carga uno o varios CFDI (emitidos/recibidos) de forma independiente, SIN balanza.
+       Pensado para backfill: re-subir el ejercicio actualiza por UPSERT los campos nuevos
+       (Clave SAT, metodo/forma de pago, pagado, fecha de pago, estatus). parse_cfdi detecta
+       la direccion por el nombre de la hoja. lista: [(nombre, data)]. Devuelve [(nombre, periodo, n_filas)]."""
+    conn = get_conn(); conn.autocommit = False; cur = conn.cursor()
+    res = []
+    try:
+        for nom, data in lista:
+            pr, n = _ingest_cfdi(cur, cli, nom, data)
+            res.append((nom, pr, n))
+        conn.commit()
+        return res
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        cur.close(); conn.close()
+
 def _num(v):
     try: return float(v) if v not in (None, '') else None
     except: return None
@@ -194,6 +212,26 @@ def registrar(cur, cli, per, tipo, envio, nombre, data):
     cur.execute("SELECT id FROM origen_archivo WHERE cliente_id=%s AND periodo=%s AND tipo=%s AND hash_sha256=%s",
                 (cli, per, tipo, _sha(data))); return cur.fetchone()[0], False
 
+def _ingest_cfdi(cur, cli, nombre, data):
+    """Parsea e ingesta un CFDI (emitido/recibido) con UPSERT por (cliente_id,uuid,renglon).
+       Re-subir backfillea Clave SAT, campos de pago y estatus en filas ya cargadas, sin duplicar.
+       Devuelve (periodo, n_filas)."""
+    crows = parse_cfdi(data)
+    if not crows:
+        return None, 0
+    pr = crows[0][3]
+    arch, _new = registrar(cur, cli, pr, 'CFDI', None, nombre, data)
+    execute_values(cur, """INSERT INTO raw_cfdi (uuid,renglon,direccion,periodo,fecha_emision,fecha_timbrado,tipo_cfdi,uso_cfdi,estatus_sat,contraparte_rfc,contraparte_nom,concepto,subtotal,descuento,iva_16,iva_8,iva_retenido,isr_retenido,total,cuenta_contable,centro_costos,uuid_relacionado,metodo_pago,forma_pago,pagado,importe_pendiente,fecha_pago,clave_sat,cliente_id,archivo_id)
+        VALUES %s
+        ON CONFLICT (cliente_id,uuid,renglon) DO UPDATE SET
+          metodo_pago=EXCLUDED.metodo_pago, forma_pago=EXCLUDED.forma_pago,
+          pagado=EXCLUDED.pagado, importe_pendiente=EXCLUDED.importe_pendiente,
+          fecha_pago=EXCLUDED.fecha_pago, estatus_sat=EXCLUDED.estatus_sat,
+          clave_sat=EXCLUDED.clave_sat""",
+        [t+(cli,arch) for t in crows])
+    return pr, len(crows)
+
+
 def procesar(cli, archivos):
     conn = get_conn(); conn.autocommit = False; cur = conn.cursor()
     try:
@@ -230,21 +268,8 @@ def procesar(cli, archivos):
                        ON CONFLICT (cliente_id,periodo) DO UPDATE SET archivo_vigente=EXCLUDED.archivo_vigente""", (cli, per, bal_id))
         for tipo in ('CFDI_EMITIDO', 'CFDI_RECIBIDO'):
             if tipo not in archivos: continue
-            nomc, datac = archivos[tipo]; crows = parse_cfdi(datac)
-            if not crows: continue
-            pr = crows[0][3]
-            arch, new = registrar(cur, cli, pr, 'CFDI', None, nomc, datac)
-            # Sin gate 'if new': re-subir el mismo archivo backfillea los campos de pago
-            # en filas ya cargadas (UPSERT por la PK cliente_id,uuid,renglon). Refresca tambien
-            # estatus_sat para capturar cancelaciones posteriores a la primera carga.
-            execute_values(cur, """INSERT INTO raw_cfdi (uuid,renglon,direccion,periodo,fecha_emision,fecha_timbrado,tipo_cfdi,uso_cfdi,estatus_sat,contraparte_rfc,contraparte_nom,concepto,subtotal,descuento,iva_16,iva_8,iva_retenido,isr_retenido,total,cuenta_contable,centro_costos,uuid_relacionado,metodo_pago,forma_pago,pagado,importe_pendiente,fecha_pago,clave_sat,cliente_id,archivo_id)
-                VALUES %s
-                ON CONFLICT (cliente_id,uuid,renglon) DO UPDATE SET
-                  metodo_pago=EXCLUDED.metodo_pago, forma_pago=EXCLUDED.forma_pago,
-                  pagado=EXCLUDED.pagado, importe_pendiente=EXCLUDED.importe_pendiente,
-                  fecha_pago=EXCLUDED.fecha_pago, estatus_sat=EXCLUDED.estatus_sat,
-                  clave_sat=EXCLUDED.clave_sat""",
-                [t+(cli,arch) for t in crows])
+            nomc, datac = archivos[tipo]
+            _ingest_cfdi(cur, cli, nomc, datac)
         if 'AUX_CLIENTES' in archivos:
             _ingest_aux_clientes(cur, cli, archivos['AUX_CLIENTES'][1])
         cur.execute("SELECT prueba,paso,severidad,detalle FROM fn_validar_periodo(%s)", (bal_id,)); integ = cur.fetchall()
@@ -2260,6 +2285,20 @@ st.subheader("Mezcla de ingresos · Modelo de negocio")
 st.caption("Composicion del ingreso emitido por segmento SAT (2 primeros digitos de la Clave producto/servicio). "
            "Automatico y transferible. Define la capa especifica del cliente: que tipo de negocio es y que "
            "benchmarks de margen aplican. YTD del ejercicio, sin IVA, vigente, neto de notas de credito.")
+with st.expander("Cargar CFDI emitidos — sin balanza · para backfill de Clave SAT y campos de pago", expanded=False):
+    st.caption("Re-sube los CFDI emitidos del ejercicio (uno o varios). No requiere balanza. El UPSERT actualiza "
+               "las filas ya cargadas con la Clave SAT y los campos de pago, sin duplicar. parse detecta emitido/recibido.")
+    _cfup = st.file_uploader("CFDI (.xlsx)", type=['xlsx'], accept_multiple_files=True, key="cfdi_up")
+    if _cfup and st.button("Cargar CFDI", key="cfdi_btn"):
+        try:
+            _r = cargar_cfdi(cli_id, [(f.name, f.getvalue()) for f in _cfup])
+            for nom, pr, n in _r:
+                if pr:
+                    st.success(f"{nom}: {n} comprobantes cargados/actualizados (periodo {pr}).")
+                else:
+                    st.error(f"{nom}: no se pudo leer como CFDI. Revisa el archivo.")
+        except Exception as e:
+            st.error(f"Error al cargar CFDI: {e}")
 _pmz = periodos_cargados(cli_id)
 if not _pmz:
     st.caption("Carga al menos un mes de CFDI emitidos.")
