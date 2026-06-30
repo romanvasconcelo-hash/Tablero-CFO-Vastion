@@ -94,6 +94,42 @@ def parse_aux_clientes(data):
         ejercicio = max(yrs) if yrs else None
     return ejercicio, saldos, movs
 
+
+def _ingest_aux_clientes(cur, cli, data):
+    """Parsea y reemplaza el auxiliar de Clientes de su ejercicio (replace-on-load). Devuelve (ejercicio, n_movs)."""
+    ejx, saldos_ax, movs_ax = parse_aux_clientes(data)
+    if not ejx: return None, 0
+    cur.execute("DELETE FROM raw_aux_clientes WHERE cliente_id=%s AND ejercicio=%s", (cli, ejx))
+    filas_ax = []
+    for sub, ter, sini in saldos_ax:
+        sini = sini or 0.0
+        filas_ax.append((cli, ejx, sub, ter, None, date(ejx,1,1), 'SALDO INICIAL', None,
+                         sini if sini > 0 else 0.0, -sini if sini < 0 else 0.0, None, True))
+    for (sub, ter, folio, fecha, tp, doc, debe, haber, notas) in movs_ax:
+        filas_ax.append((cli, ejx, sub, ter, folio, fecha, tp, doc, debe or 0.0, haber or 0.0, notas, False))
+    if filas_ax:
+        execute_values(cur, """INSERT INTO raw_aux_clientes
+            (cliente_id,ejercicio,subcuenta,tercero,folio,fecha,tipo_poliza,documento,debe,haber,notas,es_saldo_ini)
+            VALUES %s""", filas_ax)
+    return ejx, len(movs_ax)
+
+
+def cargar_auxiliares(cli, lista):
+    """Carga uno o varios auxiliares de Clientes de forma independiente (sin balanza).
+       lista: [(nombre, data)]. Devuelve [(nombre, ejercicio, n_movs)]."""
+    conn = get_conn(); conn.autocommit = False; cur = conn.cursor()
+    res = []
+    try:
+        for nom, data in lista:
+            ej, n = _ingest_aux_clientes(cur, cli, data)
+            res.append((nom, ej, n))
+        conn.commit()
+        return res
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        cur.close(); conn.close()
+
 def _num(v):
     try: return float(v) if v not in (None, '') else None
     except: return None
@@ -208,22 +244,7 @@ def procesar(cli, archivos):
                   fecha_pago=EXCLUDED.fecha_pago, estatus_sat=EXCLUDED.estatus_sat""",
                 [t+(cli,arch) for t in crows])
         if 'AUX_CLIENTES' in archivos:
-            _, dataa = archivos['AUX_CLIENTES']
-            ejx, saldos_ax, movs_ax = parse_aux_clientes(dataa)
-            if ejx:
-                # Replace-on-load: el auxiliar es YTD; la ultima subida (mas completa) reemplaza el ejercicio.
-                cur.execute("DELETE FROM raw_aux_clientes WHERE cliente_id=%s AND ejercicio=%s", (cli, ejx))
-                filas_ax = []
-                for sub, ter, sini in saldos_ax:
-                    sini = sini or 0.0
-                    filas_ax.append((cli, ejx, sub, ter, None, date(ejx,1,1), 'SALDO INICIAL', None,
-                                     sini if sini > 0 else 0.0, -sini if sini < 0 else 0.0, None, True))
-                for (sub, ter, folio, fecha, tp, doc, debe, haber, notas) in movs_ax:
-                    filas_ax.append((cli, ejx, sub, ter, folio, fecha, tp, doc, debe or 0.0, haber or 0.0, notas, False))
-                if filas_ax:
-                    execute_values(cur, """INSERT INTO raw_aux_clientes
-                        (cliente_id,ejercicio,subcuenta,tercero,folio,fecha,tipo_poliza,documento,debe,haber,notas,es_saldo_ini)
-                        VALUES %s""", filas_ax)
+            _ingest_aux_clientes(cur, cli, archivos['AUX_CLIENTES'][1])
         cur.execute("SELECT prueba,paso,severidad,detalle FROM fn_validar_periodo(%s)", (bal_id,)); integ = cur.fetchall()
         cur.execute("SELECT prueba,paso,severidad,detalle FROM fn_validar_madurez(%s)", (bal_id,)); madz = cur.fetchall()
         bloqueo = any((not ok) and sev=='BLOQUEANTE' for _,ok,sev,_ in integ) or any((not ok) and sev=='BLOQUEANTE' for _,ok,sev,_ in madz)
@@ -1934,7 +1955,11 @@ if subidos:
     etiquetas = {'BALANZA':'Balanza','CATALOGO':'Catálogo','CFDI_EMITIDO':'CFDI emitidos','CFDI_RECIBIDO':'CFDI recibidos','AUX_CLIENTES':'Auxiliar Clientes'}
     st.info("Detecté: " + ", ".join(etiquetas.get(t, t) for t in archivos))
     if 'BALANZA' not in archivos:
-        st.error("Falta la balanza (XML). Es obligatoria.")
+        if 'AUX_CLIENTES' in archivos:
+            st.info("Para cargar solo auxiliares de Clientes (sin balanza), usa el cargador de la sección "
+                    "**Cartera y DSO por cliente** más abajo. En esta carga mensual la balanza es obligatoria.")
+        else:
+            st.error("Falta la balanza (XML). Es obligatoria.")
 
 if st.button("Cargar y validar", type="primary", disabled=not (subidos and 'BALANZA' in archivos)):
     with st.spinner("Cargando y validando…"):
@@ -2145,6 +2170,21 @@ st.divider()
 st.subheader("Cartera y DSO por cliente · auxiliar de Clientes (105)")
 st.caption("Desde el auxiliar contabilizado. Reconcilia con la balanza. Quien te debe, cuanto y que tan viejo. "
            "DSO = saldo / facturado YTD x dias. Heredado = cartera de ejercicios anteriores aun sin cobrar.")
+with st.expander("Cargar auxiliar(es) de Clientes — uno por ejercicio · no requiere balanza", expanded=False):
+    st.caption("Sube aqui el auxiliar de la cuenta de Clientes (105). Es YTD: un archivo por ejercicio cubre todos sus meses. "
+               "Puedes subir varios a la vez (p. ej. 2025 y 2026). Se reemplaza por ejercicio en cada carga.")
+    _auxup = st.file_uploader("Auxiliar(es) de Clientes (.xlsx)", type=['xlsx'],
+                              accept_multiple_files=True, key="aux_up")
+    if _auxup and st.button("Cargar auxiliares", key="aux_btn"):
+        try:
+            _res = cargar_auxiliares(cli_id, [(f.name, f.getvalue()) for f in _auxup])
+            for nom, ej, n in _res:
+                if ej:
+                    st.success(f"{nom}: ejercicio {ej}, {n} movimientos cargados.")
+                else:
+                    st.error(f"{nom}: no se reconocio como auxiliar de Clientes (105). Revisa el archivo.")
+        except Exception as e:
+            st.error(f"Error al cargar (¿corriste la migracion raw_aux_clientes en Supabase?): {e}")
 _pdso = periodos_cargados(cli_id)
 if not _pdso:
     st.caption("Carga al menos un mes.")
