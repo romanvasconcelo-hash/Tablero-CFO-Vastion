@@ -32,6 +32,7 @@ def clasificar(nombre, data):
         return 'XML_DESCONOCIDO'
     if nombre.lower().endswith('.xlsx'):
         wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True); s = wb.sheetnames[0].upper(); wb.close()
+        if 'AUXILIAR' in s: return 'AUX_CLIENTES'
         if 'INGRESO' in s: return 'CFDI_EMITIDO'
         if 'EGRESO' in s:  return 'CFDI_RECIBIDO'
         return 'XLSX_DESCONOCIDO'
@@ -52,9 +53,56 @@ def parse_balanza(data):
              float(c.attrib['Haber']), float(c.attrib['SaldoFin'])) for c in root.findall('x:Ctas', ns)]
     return meta, rows
 
+
+def parse_aux_clientes(data):
+    """Auxiliar de la cuenta de Clientes (105). Cada movimiento se autodescribe (col5=cuenta, col4=tercero).
+       Devuelve (ejercicio, saldos_ini, movs). saldos_ini: (subcuenta, tercero, saldo_ini).
+       movs: (subcuenta, tercero, folio, fecha, tipo_poliza, documento, debe, haber, notas).
+       Solo cuentas que abren con '105'. Tipos reales: 'Factura' (cargo) y 'Movimiento Conciliado' (cobro)."""
+    wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]; rows = list(ws.iter_rows(values_only=True)); wb.close()
+    ejercicio = None
+    for r in rows[:6]:
+        for c in r:
+            if c and 'Período' in str(c):
+                toks = ''.join(ch if ch.isdigit() else ' ' for ch in str(c)).split()
+                yrs = [int(t) for t in toks if len(t) == 4]
+                if yrs: ejercicio = yrs[0]
+    saldos = []; movs = []; i = 0
+    while i < len(rows):
+        r = rows[i]; c0 = str(r[0]).strip() if r[0] is not None else ''
+        if c0 == 'Cuenta:' and i + 1 < len(rows):
+            acc = str(rows[i+1][0]) if rows[i+1][0] else ''
+            if acc.startswith('105'):
+                sub = acc.split('~')[0].strip()
+                ter = acc.split('~')[1].strip()[:80] if '~' in acc else None
+                saldos.append((sub, ter, _mnum(rows[i+1][1])))
+            i += 2; continue
+        tp = str(r[2]).strip() if (len(r) > 2 and r[2] is not None) else ''
+        if tp in ('Factura', 'Movimiento Conciliado'):
+            cta = str(r[5]) if (len(r) > 5 and r[5]) else ''
+            if cta.startswith('105'):
+                sub = cta.split('~')[0].strip()
+                ter = str(r[4])[:80] if (len(r) > 4 and r[4]) else None
+                movs.append((sub, ter, str(r[0])[:40] if r[0] else None, _fecha(r[1]), tp,
+                             str(r[3])[:40] if (len(r) > 3 and r[3]) else None,
+                             _mnum(r[6]), _mnum(r[7]),
+                             str(r[10])[:200] if (len(r) > 10 and r[10]) else None))
+        i += 1
+    if ejercicio is None and movs:
+        yrs = [m[3].year for m in movs if m[3]]
+        ejercicio = max(yrs) if yrs else None
+    return ejercicio, saldos, movs
+
 def _num(v):
     try: return float(v) if v not in (None, '') else None
     except: return None
+def _mnum(v):
+    """Monto que puede venir como '$1,234.56' (auxiliar). Devuelve 0.0 si no parsea."""
+    if isinstance(v, (int, float)): return float(v)
+    if v in (None, ''): return 0.0
+    try: return float(str(v).replace('$', '').replace(',', '').strip())
+    except: return 0.0
 def _fecha(v):
     if isinstance(v, (datetime, date)): return v
     if not v: return None
@@ -159,6 +207,23 @@ def procesar(cli, archivos):
                   pagado=EXCLUDED.pagado, importe_pendiente=EXCLUDED.importe_pendiente,
                   fecha_pago=EXCLUDED.fecha_pago, estatus_sat=EXCLUDED.estatus_sat""",
                 [t+(cli,arch) for t in crows])
+        if 'AUX_CLIENTES' in archivos:
+            _, dataa = archivos['AUX_CLIENTES']
+            ejx, saldos_ax, movs_ax = parse_aux_clientes(dataa)
+            if ejx:
+                # Replace-on-load: el auxiliar es YTD; la ultima subida (mas completa) reemplaza el ejercicio.
+                cur.execute("DELETE FROM raw_aux_clientes WHERE cliente_id=%s AND ejercicio=%s", (cli, ejx))
+                filas_ax = []
+                for sub, ter, sini in saldos_ax:
+                    sini = sini or 0.0
+                    filas_ax.append((cli, ejx, sub, ter, None, date(ejx,1,1), 'SALDO INICIAL', None,
+                                     sini if sini > 0 else 0.0, -sini if sini < 0 else 0.0, None, True))
+                for (sub, ter, folio, fecha, tp, doc, debe, haber, notas) in movs_ax:
+                    filas_ax.append((cli, ejx, sub, ter, folio, fecha, tp, doc, debe or 0.0, haber or 0.0, notas, False))
+                if filas_ax:
+                    execute_values(cur, """INSERT INTO raw_aux_clientes
+                        (cliente_id,ejercicio,subcuenta,tercero,folio,fecha,tipo_poliza,documento,debe,haber,notas,es_saldo_ini)
+                        VALUES %s""", filas_ax)
         cur.execute("SELECT prueba,paso,severidad,detalle FROM fn_validar_periodo(%s)", (bal_id,)); integ = cur.fetchall()
         cur.execute("SELECT prueba,paso,severidad,detalle FROM fn_validar_madurez(%s)", (bal_id,)); madz = cur.fetchall()
         bloqueo = any((not ok) and sev=='BLOQUEANTE' for _,ok,sev,_ in integ) or any((not ok) and sev=='BLOQUEANTE' for _,ok,sev,_ in madz)
@@ -1126,6 +1191,46 @@ def top_clientes(cli, periodo, n=10):
         cur.close(); conn.close()
 
 
+def dso_clientes(cli, periodo):
+    """DSO por cliente desde el auxiliar de Clientes (105), as-of el mes seleccionado (YTD del ejercicio).
+       saldo = saldo_ini + facturado - cobrado; DSO = saldo / facturado x dias_YTD (None si no facturo).
+       Heredado = apertura aun sin cobrar (FIFO: cobros consumen apertura primero). Reconcilia con el agregado."""
+    y = int(str(periodo)[:4]); m = int(str(periodo)[5:7]); ej = y
+    jan1 = date(ej, 1, 1)
+    nxt = date(y+1, 1, 1) if m == 12 else date(y, m+1, 1)
+    dias = (nxt - jan1).days
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT subcuenta, max(tercero) AS tercero,
+                   sum(CASE WHEN es_saldo_ini THEN debe-haber ELSE 0 END) AS saldo_ini,
+                   sum(CASE WHEN NOT es_saldo_ini AND tipo_poliza='Factura' AND fecha < %s THEN debe ELSE 0 END) AS facturado,
+                   sum(CASE WHEN NOT es_saldo_ini AND tipo_poliza='Movimiento Conciliado' AND fecha < %s THEN haber ELSE 0 END) AS cobrado
+            FROM raw_aux_clientes
+            WHERE cliente_id=%s AND ejercicio=%s
+            GROUP BY subcuenta
+        """, (nxt, nxt, cli, ej))
+        filas = cur.fetchall()
+    finally:
+        cur.close(); conn.close()
+    out = []
+    for sub, ter, sini, fact, cob in filas:
+        sini = float(sini or 0); fact = float(fact or 0); cob = float(cob or 0)
+        saldo = sini + fact - cob
+        if abs(sini) < 1 and abs(fact) < 1 and abs(saldo) < 1: continue
+        dso = round(saldo / fact * dias, 0) if fact > 1 else None
+        heredado = max(sini - cob, 0.0)
+        out.append(dict(sub=sub, tercero=ter, saldo_ini=sini, facturado=fact, cobrado=cob,
+                        saldo=saldo, dso=dso, heredado=heredado, corriente=saldo - heredado))
+    out.sort(key=lambda x: -x["saldo"])
+    tot_saldo = sum(o["saldo"] for o in out); tot_fact = sum(o["facturado"] for o in out)
+    for o in out:
+        o["pct"] = round(100 * o["saldo"] / tot_saldo, 1) if tot_saldo else None
+    dso_base = round(tot_saldo / tot_fact * dias, 0) if tot_fact else None
+    return dict(rows=out, tot_saldo=tot_saldo, tot_fact=tot_fact, tot_heredado=sum(o["heredado"] for o in out),
+                dias=dias, dso_base=dso_base)
+
+
 SAT_LBL = {
     '101':'Caja','102':'Bancos','103':'Inversiones','104':'Inversiones',
     '105':'Clientes','106':'Documentos por cobrar','107':'Deudores diversos',
@@ -1816,7 +1921,8 @@ with st.expander("Datos del cliente · Constancia de Situación Fiscal", expande
         except Exception as e:
             st.error(f"No se pudieron guardar (¿corriste cliente_csf.sql en Supabase?). {e}")
 
-st.markdown("**Suelta aquí los archivos del mes** (balanza XML obligatoria; catálogo XML la primera vez; CFDI emitidos y recibidos):")
+st.markdown("**Suelta aquí los archivos del mes** (balanza XML obligatoria; catálogo XML la primera vez; "
+            "CFDI emitidos y recibidos; auxiliar de Clientes para cartera/DSO):")
 subidos = st.file_uploader("Arrastra los archivos", accept_multiple_files=True,
                            type=['xml','xlsx'], label_visibility='collapsed')
 
@@ -1825,7 +1931,7 @@ if subidos:
     for f in subidos:
         data = f.getvalue(); tipo = clasificar(f.name, data)
         archivos[tipo] = (f.name, data)
-    etiquetas = {'BALANZA':'Balanza','CATALOGO':'Catálogo','CFDI_EMITIDO':'CFDI emitidos','CFDI_RECIBIDO':'CFDI recibidos'}
+    etiquetas = {'BALANZA':'Balanza','CATALOGO':'Catálogo','CFDI_EMITIDO':'CFDI emitidos','CFDI_RECIBIDO':'CFDI recibidos','AUX_CLIENTES':'Auxiliar Clientes'}
     st.info("Detecté: " + ", ".join(etiquetas.get(t, t) for t in archivos))
     if 'BALANZA' not in archivos:
         st.error("Falta la balanza (XML). Es obligatoria.")
@@ -2030,6 +2136,40 @@ else:
                     use_container_width=True, hide_index=True)
             else:
                 st.caption("Sin CFDI emitidos en el rango.")
+
+
+# ---------------------------------------------------------------------------
+# CARTERA Y DSO POR CLIENTE (auxiliar de Clientes 105) - cobranza real
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Cartera y DSO por cliente · auxiliar de Clientes (105)")
+st.caption("Desde el auxiliar contabilizado. Reconcilia con la balanza. Quien te debe, cuanto y que tan viejo. "
+           "DSO = saldo / facturado YTD x dias. Heredado = cartera de ejercicios anteriores aun sin cobrar.")
+_pdso = periodos_cargados(cli_id)
+if not _pdso:
+    st.caption("Carga al menos un mes.")
+else:
+    mes_dso = st.selectbox("Mes", _pdso, key="dso_mes")
+    if st.button("Ver cartera y DSO", key="dso_btn"):
+        dd = dso_clientes(cli_id, mes_dso)
+        if not dd["rows"]:
+            st.warning("No hay auxiliar de Clientes cargado para este ejercicio. "
+                       "Sube el archivo AUXILIAR_DE_CUENTAS del cliente en la carga del mes.")
+        else:
+            st.markdown(f"**DSO agregado (base del ejercicio): {dd['dso_base']:.0f} dias** · "
+                        f"cartera total {money(dd['tot_saldo'])} · facturado YTD {money(dd['tot_fact'])} · "
+                        f"heredado {money(dd['tot_heredado'])}")
+            st.caption("El DSO agregado se infla con cartera heredada congelada. La columna Heredado la aisla: "
+                       "lo que sigue en cero o creciendo ahi es cobranza estancada, no DSO operativo.")
+            st.dataframe(
+                [{"Cliente": o["tercero"], "Cuenta": o["sub"],
+                  "Cartera": money(o["saldo"]),
+                  "%": (f"{o['pct']}%" if o["pct"] is not None else ""),
+                  "DSO": (f"{o['dso']:.0f}" if o["dso"] is not None else "s/fact"),
+                  "Heredado": money(o["heredado"]),
+                  "Facturado YTD": money(o["facturado"]),
+                  "Cobrado YTD": money(o["cobrado"])} for o in dd["rows"]],
+                use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
