@@ -163,7 +163,7 @@ def parse_cfdi(data):
         ivar='IVA Retención',isrr='ISR Retención',total='Total',cc='Cuenta Contable',
         cco='Centro de Costos',uuidr='UUID Relacionado',
         metodo='Método de Pago',forma='Forma de Pago',pagado='Pagado',
-        pend='Importe pendiente',fpago='Fecha de pago').items()}
+        pend='Importe pendiente',fpago='Fecha de pago',clave='Clave SAT').items()}
     out = []; cont = {}
     g = lambda r, k: (r[C[k]] if C.get(k) is not None else None)   # columna ausente -> None (CFDI recibidos)
     for r in rows[4:]:
@@ -178,7 +178,8 @@ def parse_cfdi(data):
             str(r[C['prod']])[:200] if r[C['prod']] else None,
             _num(r[C['sub']]),_num(r[C['desc']]),_num(r[C['iva16']]),_num(r[C['iva8']]),
             _num(r[C['ivar']]),_num(r[C['isrr']]),_num(r[C['total']]),acc,r[C['cco']],r[C['uuidr']],
-            g(r,'metodo'), g(r,'forma'), pagado, _num(g(r,'pend')), _fecha(g(r,'fpago'))))
+            g(r,'metodo'), g(r,'forma'), pagado, _num(g(r,'pend')), _fecha(g(r,'fpago')),
+            (str(g(r,'clave')).strip()[:20] if g(r,'clave') is not None else None)))
     return out
 
 # ---------------------------------------------------------------------------
@@ -236,12 +237,13 @@ def procesar(cli, archivos):
             # Sin gate 'if new': re-subir el mismo archivo backfillea los campos de pago
             # en filas ya cargadas (UPSERT por la PK cliente_id,uuid,renglon). Refresca tambien
             # estatus_sat para capturar cancelaciones posteriores a la primera carga.
-            execute_values(cur, """INSERT INTO raw_cfdi (uuid,renglon,direccion,periodo,fecha_emision,fecha_timbrado,tipo_cfdi,uso_cfdi,estatus_sat,contraparte_rfc,contraparte_nom,concepto,subtotal,descuento,iva_16,iva_8,iva_retenido,isr_retenido,total,cuenta_contable,centro_costos,uuid_relacionado,metodo_pago,forma_pago,pagado,importe_pendiente,fecha_pago,cliente_id,archivo_id)
+            execute_values(cur, """INSERT INTO raw_cfdi (uuid,renglon,direccion,periodo,fecha_emision,fecha_timbrado,tipo_cfdi,uso_cfdi,estatus_sat,contraparte_rfc,contraparte_nom,concepto,subtotal,descuento,iva_16,iva_8,iva_retenido,isr_retenido,total,cuenta_contable,centro_costos,uuid_relacionado,metodo_pago,forma_pago,pagado,importe_pendiente,fecha_pago,clave_sat,cliente_id,archivo_id)
                 VALUES %s
                 ON CONFLICT (cliente_id,uuid,renglon) DO UPDATE SET
                   metodo_pago=EXCLUDED.metodo_pago, forma_pago=EXCLUDED.forma_pago,
                   pagado=EXCLUDED.pagado, importe_pendiente=EXCLUDED.importe_pendiente,
-                  fecha_pago=EXCLUDED.fecha_pago, estatus_sat=EXCLUDED.estatus_sat""",
+                  fecha_pago=EXCLUDED.fecha_pago, estatus_sat=EXCLUDED.estatus_sat,
+                  clave_sat=EXCLUDED.clave_sat""",
                 [t+(cli,arch) for t in crows])
         if 'AUX_CLIENTES' in archivos:
             _ingest_aux_clientes(cur, cli, archivos['AUX_CLIENTES'][1])
@@ -1210,6 +1212,67 @@ def top_clientes(cli, periodo, n=10):
         return out
     finally:
         cur.close(); conn.close()
+
+
+SEG_SAT = {
+    '10':'Material vivo vegetal y animal','11':'Material mineral y textil','12':'Productos quimicos',
+    '13':'Resinas, caucho y espumas','14':'Papel y productos de papel','15':'Combustibles y lubricantes',
+    '20':'Maquinaria de mineria y perforacion','21':'Maquinaria agricola','22':'Maquinaria de construccion',
+    '23':'Maquinaria industrial','24':'Manejo y almacenaje de materiales','25':'Vehiculos y transporte',
+    '26':'Generacion y distribucion de energia','27':'Herramientas y maquinaria general','30':'Materiales de construccion y estructuras',
+    '31':'Componentes de manufactura','32':'Componentes y suministros electronicos','39':'Equipo electrico e iluminacion',
+    '40':'Climatizacion y distribucion de fluidos','41':'Equipo de laboratorio y medicion','42':'Equipo y suministros medicos',
+    '43':'Tecnologia de la informacion','44':'Equipo y suministros de oficina','45':'Equipo de impresion y fotografia',
+    '46':'Equipo de defensa y seguridad','47':'Equipo de limpieza','48':'Equipo de hosteleria y comercio',
+    '49':'Equipo deportivo y recreativo','50':'Alimentos y bebidas','51':'Productos farmaceuticos','52':'Articulos para el hogar',
+    '53':'Ropa, calzado y equipaje','55':'Productos impresos y editoriales','56':'Mobiliario','60':'Instrumentos musicales y arte',
+    '70':'Servicios agricolas, pesca y forestal','71':'Servicios de mineria, petroleo y gas',
+    '72':'Construccion, instalaciones y mantenimiento','73':'Servicios de produccion industrial','76':'Servicios de limpieza industrial',
+    '77':'Servicios medioambientales','78':'Transporte, almacenaje y correo','80':'Servicios de gestion y administrativos',
+    '81':'Ingenieria, investigacion y tecnologia','82':'Servicios editoriales, diseno y artes graficas','83':'Servicios publicos (utilities)',
+    '84':'Servicios financieros y de seguros','85':'Servicios de salud','86':'Servicios educativos',
+    '90':'Viajes, alimentacion, hospedaje y entretenimiento','91':'Servicios personales y domesticos',
+    '92':'Seguridad y orden publico','93':'Servicios politicos y de organizaciones','94':'Organizaciones y asociaciones',
+    '95':'Terrenos, edificios y estructuras',
+}
+
+
+def mezcla_ingresos(cli, periodo):
+    """Modelo de negocio: mezcla del ingreso emitido por segmento SAT (2 primeros digitos de la Clave
+       producto/servicio). Ingreso neto sin IVA, vigente, neto de notas de credito. Ventana YTD del ejercicio
+       (consistente con ER/EFE). Automatico y transferible: el segmento agrupa sin configuracion por cliente."""
+    y = int(str(periodo)[:4])
+    ene1 = date(y, 1, 1)
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT left(clave_sat, 2) AS seg,
+                   count(DISTINCT uuid) AS fac,
+                   sum(CASE WHEN lower(tipo_cfdi)='egreso' THEN -1 ELSE 1 END
+                       * (COALESCE(subtotal,0) - COALESCE(descuento,0))) AS neto
+            FROM raw_cfdi
+            WHERE cliente_id=%s AND direccion='EMITIDO'
+              AND lower(estatus_sat)='vigente' AND lower(tipo_cfdi) IN ('ingreso','egreso')
+              AND periodo >= %s AND periodo <= %s
+            GROUP BY left(clave_sat, 2)
+            ORDER BY neto DESC
+        """, (cli, ene1, periodo))
+        filas = cur.fetchall()
+    finally:
+        cur.close(); conn.close()
+    tot = sum(float(f[2] or 0) for f in filas)
+    rows = []; sin_clave = 0.0
+    for seg, fac, neto in filas:
+        neto = float(neto or 0)
+        if abs(neto) < 1: continue
+        if not seg:                                    # CFDI sin Clave SAT (viejos, sin backfill)
+            sin_clave += neto; continue
+        rows.append(dict(seg=seg, etiqueta=SEG_SAT.get(seg, "Segmento " + seg),
+                         neto=neto, facturas=fac,
+                         pct=(round(100 * neto / tot, 1) if tot else None)))
+    pct_sin = round(100 * sin_clave / tot, 1) if tot else 0.0
+    return dict(rows=rows, total=tot, ejercicio=y,
+                dominante=(rows[0] if rows else None), pct_sin_clave=pct_sin)
 
 
 def cartera_clientes(cli, periodo):
@@ -2190,10 +2253,43 @@ else:
 
 
 # ---------------------------------------------------------------------------
-# CARTERA POR CLIENTE (saldo desde la BALANZA, cuenta Clientes 105) - prioridad de cobranza
+# MEZCLA DE INGRESOS / MODELO DE NEGOCIO (CFDI emitidos por segmento SAT)
 # ---------------------------------------------------------------------------
 st.divider()
-st.subheader("Cartera por cliente · cuenta Clientes (105)")
+st.subheader("Mezcla de ingresos · Modelo de negocio")
+st.caption("Composicion del ingreso emitido por segmento SAT (2 primeros digitos de la Clave producto/servicio). "
+           "Automatico y transferible. Define la capa especifica del cliente: que tipo de negocio es y que "
+           "benchmarks de margen aplican. YTD del ejercicio, sin IVA, vigente, neto de notas de credito.")
+_pmz = periodos_cargados(cli_id)
+if not _pmz:
+    st.caption("Carga al menos un mes de CFDI emitidos.")
+else:
+    mes_mz = st.selectbox("Mes", _pmz, key="mz_mes")
+    if st.button("Ver mezcla", key="mz_btn"):
+        mz = mezcla_ingresos(cli_id, mes_mz)
+        if not mz["rows"] and mz["pct_sin_clave"] >= 90:
+            st.warning("Los CFDI cargados no traen Clave SAT (columna no capturada antes de esta version). "
+                       "Vuelve a subir los CFDI emitidos del ejercicio para backfillear la Clave SAT; "
+                       "entonces el modelo de negocio aparece. El UPSERT actualiza las filas ya cargadas.")
+        elif not mz["rows"]:
+            st.warning("No hay CFDI emitidos vigentes en el ejercicio para ese mes.")
+        else:
+            d = mz["dominante"]
+            st.markdown(f"**Modelo de negocio: {d['etiqueta']} ({d['pct']}%)** · "
+                        f"ingreso YTD {money(mz['total'])} · {len(mz['rows'])} segmento(s).")
+            st.caption("El segmento dominante define la capa especifica. Si dos segmentos cubren el grueso, "
+                       "el cliente tiene dos lineas; si uno solo concentra >80%, es monolinea.")
+            st.dataframe(
+                [{"Segmento": "[" + r["seg"] + "] " + r["etiqueta"],
+                  "Ingreso YTD": money(r["neto"]),
+                  "%": (f"{r['pct']}%" if r["pct"] is not None else ""),
+                  "Fac": r["facturas"]} for r in mz["rows"]],
+                use_container_width=True, hide_index=True)
+            if mz["pct_sin_clave"] > 0:
+                st.caption(f"Nota: {mz['pct_sin_clave']}% del ingreso sin Clave SAT (CFDI viejos sin backfill). "
+                           "Re-sube los CFDI del ejercicio para cerrarlo.")
+
+
 st.caption("Saldo por cobrar de cada cliente, desde la BALANZA (fuente autoritativa; reconcilia por construccion). "
            "Ordenado por exposicion: por aqui empieza la cobranza. El ultimo movimiento (del auxiliar) marca la "
            "cartera congelada: saldo grande + sin movimiento reciente = dinero estancado, prioridad uno.")
