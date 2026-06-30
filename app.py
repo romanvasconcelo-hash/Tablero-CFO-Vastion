@@ -1234,7 +1234,7 @@ def dso_clientes(cli, periodo):
         filas = cur.fetchall()
         # Guardia de reconciliacion: saldo de Clientes (agrupador 105) segun la balanza del mes.
         cur.execute("""SELECT COALESCE(sum(saldo_final),0) FROM insumos_balanza
-                       WHERE cliente_id=%s AND periodo=%s AND es_hoja AND cod_agrupador='105'""", (cli, periodo))
+                       WHERE cliente_id=%s AND periodo=%s AND es_hoja AND cod_agrupador LIKE '105%%'""", (cli, periodo))
         bal105 = float(cur.fetchone()[0] or 0)
     finally:
         cur.close(); conn.close()
