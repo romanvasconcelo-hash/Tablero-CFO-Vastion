@@ -1232,6 +1232,10 @@ def dso_clientes(cli, periodo):
             GROUP BY subcuenta
         """, (nxt, nxt, cli, ej))
         filas = cur.fetchall()
+        # Guardia de reconciliacion: saldo de Clientes (agrupador 105) segun la balanza del mes.
+        cur.execute("""SELECT COALESCE(sum(saldo_final),0) FROM insumos_balanza
+                       WHERE cliente_id=%s AND periodo=%s AND es_hoja AND cod_agrupador='105'""", (cli, periodo))
+        bal105 = float(cur.fetchone()[0] or 0)
     finally:
         cur.close(); conn.close()
     out = []
@@ -1248,8 +1252,10 @@ def dso_clientes(cli, periodo):
     for o in out:
         o["pct"] = round(100 * o["saldo"] / tot_saldo, 1) if tot_saldo else None
     dso_base = round(tot_saldo / tot_fact * dias, 0) if tot_fact else None
+    diff = tot_saldo - bal105
+    reconcilia = abs(diff) <= max(100.0, 0.01 * abs(bal105))   # tolerancia 1% o $100
     return dict(rows=out, tot_saldo=tot_saldo, tot_fact=tot_fact, tot_heredado=sum(o["heredado"] for o in out),
-                dias=dias, dso_base=dso_base)
+                dias=dias, dso_base=dso_base, bal105=bal105, diff=diff, reconcilia=reconcilia)
 
 
 SAT_LBL = {
@@ -2199,6 +2205,14 @@ else:
             st.markdown(f"**DSO agregado (base del ejercicio): {dd['dso_base']:.0f} dias** · "
                         f"cartera total {money(dd['tot_saldo'])} · facturado YTD {money(dd['tot_fact'])} · "
                         f"heredado {money(dd['tot_heredado'])}")
+            if dd.get("reconcilia"):
+                st.caption(f"🟢 Reconcilia con balanza · Clientes (105) en balanza {money(dd['bal105'])} "
+                           f"≈ cartera del auxiliar {money(dd['tot_saldo'])}.")
+            else:
+                st.error(f"🔴 NO reconcilia con la balanza. Clientes (105) en balanza = {money(dd['bal105'])} "
+                         f"vs auxiliar = {money(dd['tot_saldo'])} · diferencia {money(dd['diff'])}. "
+                         f"El auxiliar esta incompleto (faltan cuentas, p. ej. exportado sin cuentas sin movimiento) "
+                         f"o hay descuadre. No reportar cartera hasta cerrar la diferencia.")
             st.caption("El DSO agregado se infla con cartera heredada congelada. La columna Heredado la aisla: "
                        "lo que sigue en cero o creciendo ahi es cobranza estancada, no DSO operativo.")
             st.dataframe(
