@@ -1071,6 +1071,43 @@ def periodos_cargados(cli):
         cur.close(); conn.close()
 
 
+def top_clientes(cli, periodo, n=10):
+    """Top-N clientes por ingreso neto emitido (sin IVA, vigente, neto de notas de credito).
+       Llave = RFC (Codigo Cliente viene vacio). Devuelve 'mes' y 'acumulado' (<= periodo),
+       con total, # clientes, lista top y concentracion (cliente #1 y Top 3). Alimenta Alerta #3."""
+    conn = get_conn(); cur = conn.cursor(); out = {}
+    try:
+        for clave, op in (("mes", "="), ("acumulado", "<=")):
+            cur.execute(f"""
+                WITH base AS (
+                  SELECT contraparte_rfc AS rfc, contraparte_nom AS nom, uuid, tipo_cfdi,
+                         (COALESCE(subtotal,0)-COALESCE(descuento,0)) AS neto
+                  FROM raw_cfdi
+                  WHERE cliente_id=%s AND direccion='EMITIDO'
+                    AND lower(estatus_sat)='vigente'
+                    AND lower(tipo_cfdi) IN ('ingreso','egreso')
+                    AND periodo {op} %s
+                ),
+                por_cliente AS (
+                  SELECT rfc, max(nom) AS cliente, count(DISTINCT uuid) AS facturas,
+                         sum(CASE WHEN lower(tipo_cfdi)='egreso' THEN -neto ELSE neto END) AS ingreso_neto
+                  FROM base GROUP BY rfc
+                )
+                SELECT rfc, cliente, ingreso_neto, facturas
+                FROM por_cliente ORDER BY ingreso_neto DESC
+            """, (cli, periodo))
+            filas = cur.fetchall()
+            total = sum(float(f[2] or 0) for f in filas)
+            top = [dict(rfc=f[0], cliente=f[1], neto=float(f[2] or 0), facturas=f[3],
+                        pct=(round(100*float(f[2] or 0)/total, 1) if total else None)) for f in filas[:n]]
+            conc1 = round(100*top[0]["neto"]/total, 1) if top and total else None
+            conc3 = round(100*sum(t["neto"] for t in top[:3])/total, 1) if top and total else None
+            out[clave] = dict(total=total, clientes=len(filas), top=top, conc_top1=conc1, conc_top3=conc3)
+        return out
+    finally:
+        cur.close(); conn.close()
+
+
 SAT_LBL = {
     '101':'Caja','102':'Bancos','103':'Inversiones','104':'Inversiones',
     '105':'Clientes','106':'Documentos por cobrar','107':'Deudores diversos',
@@ -1944,6 +1981,37 @@ else:
                 st.dataframe(
                     [{"Concepto": c, "Monto": f"{m:,.0f}", "%": (f"{p}%" if p is not None else "")} for c, m, p in ind['pl']],
                     use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# TOP 10 CLIENTES (CFDI EMITIDOS) - alimenta Alerta #3 (concentracion de cliente)
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Top 10 Clientes · CFDI emitidos")
+st.caption("Ingreso neto facturado (sin IVA, vigente, neto de notas de credito). "
+           "Llave = RFC. Alimenta la Alerta #3 (concentracion de cliente).")
+_ptc = periodos_cargados(cli_id)
+if not _ptc:
+    st.caption("Carga al menos un mes de CFDI emitidos.")
+else:
+    mes_tc = st.selectbox("Mes", _ptc, key="tc_mes")
+    if st.button("Ver Top 10", key="tc_btn"):
+        data = top_clientes(cli_id, mes_tc)
+        for clave, titulo in (("mes", "Del mes"), ("acumulado", "Acumulado al mes")):
+            d = data[clave]
+            st.markdown(f"**{titulo}** — {d['clientes']} clientes · ingreso neto {money(d['total'])}")
+            if d["conc_top1"] is not None:
+                luz = "🔴" if d["conc_top1"] >= 50 else ("🟡" if d["conc_top1"] >= 30 else "🟢")
+                st.caption(f"{luz} Concentracion · cliente #1 = {d['conc_top1']}% · Top 3 = {d['conc_top3']}%")
+            if d["top"]:
+                st.dataframe(
+                    [{"#": i, "Cliente": t["cliente"], "RFC": t["rfc"],
+                      "Ingreso neto": money(t["neto"]),
+                      "%": (f"{t['pct']}%" if t["pct"] is not None else ""),
+                      "Fac": t["facturas"]} for i, t in enumerate(d["top"], 1)],
+                    use_container_width=True, hide_index=True)
+            else:
+                st.caption("Sin CFDI emitidos en el rango.")
 
 
 # ---------------------------------------------------------------------------
