@@ -1073,11 +1073,17 @@ def periodos_cargados(cli):
 
 def top_clientes(cli, periodo, n=10):
     """Top-N clientes por ingreso neto emitido (sin IVA, vigente, neto de notas de credito).
-       Llave = RFC (Codigo Cliente viene vacio). Devuelve 'mes' y 'acumulado' (<= periodo),
-       con total, # clientes, lista top y concentracion (cliente #1 y Top 3). Alimenta Alerta #3."""
+       Llave = RFC (Codigo Cliente viene vacio). Devuelve 'mes' (periodo exacto) y
+       'acumulado' (YTD del ejercicio: del 1-ene del anio del periodo al periodo, reinicia
+       en enero igual que ER/EFE). Trae total, # clientes, lista top y concentracion. Alimenta Alerta #3."""
     conn = get_conn(); cur = conn.cursor(); out = {}
     try:
-        for clave, op in (("mes", "="), ("acumulado", "<=")):
+        for clave in ("mes", "acumulado"):
+            if clave == "mes":
+                cond, params = "periodo = %s", (cli, periodo)
+            else:  # YTD del ejercicio (reinicia en enero, consistente con estados financieros)
+                cond, params = ("periodo >= date_trunc('year', %s::date) AND periodo <= %s",
+                                (cli, periodo, periodo))
             cur.execute(f"""
                 WITH base AS (
                   SELECT contraparte_rfc AS rfc, contraparte_nom AS nom, uuid, tipo_cfdi,
@@ -1086,7 +1092,7 @@ def top_clientes(cli, periodo, n=10):
                   WHERE cliente_id=%s AND direccion='EMITIDO'
                     AND lower(estatus_sat)='vigente'
                     AND lower(tipo_cfdi) IN ('ingreso','egreso')
-                    AND periodo {op} %s
+                    AND {cond}
                 ),
                 por_cliente AS (
                   SELECT rfc, max(nom) AS cliente, count(DISTINCT uuid) AS facturas,
@@ -1095,7 +1101,7 @@ def top_clientes(cli, periodo, n=10):
                 )
                 SELECT rfc, cliente, ingreso_neto, facturas
                 FROM por_cliente ORDER BY ingreso_neto DESC
-            """, (cli, periodo))
+            """, params)
             filas = cur.fetchall()
             total = sum(float(f[2] or 0) for f in filas)
             top = [dict(rfc=f[0], cliente=f[1], neto=float(f[2] or 0), facturas=f[3],
@@ -1997,7 +2003,7 @@ else:
     mes_tc = st.selectbox("Mes", _ptc, key="tc_mes")
     if st.button("Ver Top 10", key="tc_btn"):
         data = top_clientes(cli_id, mes_tc)
-        for clave, titulo in (("mes", "Del mes"), ("acumulado", "Acumulado al mes")):
+        for clave, titulo in (("mes", "Del mes"), ("acumulado", "Acumulado del ejercicio (YTD)")):
             d = data[clave]
             st.markdown(f"**{titulo}** — {d['clientes']} clientes · ingreso neto {money(d['total'])}")
             if d["conc_top1"] is not None:
