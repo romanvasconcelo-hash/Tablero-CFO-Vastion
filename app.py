@@ -224,6 +224,12 @@ def _ingest_cfdi(cur, cli, nombre, data):
     execute_values(cur, """INSERT INTO raw_cfdi (uuid,renglon,direccion,periodo,fecha_emision,fecha_timbrado,tipo_cfdi,uso_cfdi,estatus_sat,contraparte_rfc,contraparte_nom,concepto,subtotal,descuento,iva_16,iva_8,iva_retenido,isr_retenido,total,cuenta_contable,centro_costos,uuid_relacionado,metodo_pago,forma_pago,pagado,importe_pendiente,fecha_pago,clave_sat,cliente_id,archivo_id)
         VALUES %s ON CONFLICT DO NOTHING""",
         [t+(cli,arch) for t in crows])
+    # Tabla derivada uuid -> Clave SAT. Mutable (no es raw): aqui SI se permite UPSERT.
+    # Resuelve los comprobantes ya cargados sin Clave SAT (raw_cfdi es inmutable) sin tocar raw_cfdi.
+    clave_rows = [(cli, t[0], t[27]) for t in crows if t[27]]
+    if clave_rows:
+        execute_values(cur, """INSERT INTO cfdi_clave (cliente_id, uuid, clave_sat) VALUES %s
+            ON CONFLICT (cliente_id, uuid) DO UPDATE SET clave_sat=EXCLUDED.clave_sat""", clave_rows)
     return pr, len(crows)
 
 
@@ -1266,24 +1272,26 @@ def mezcla_ingresos(cli, periodo):
     conn = get_conn(); cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT left(clave_sat, 2) AS seg,
-                   count(DISTINCT uuid) AS fac,
-                   sum(CASE WHEN lower(tipo_cfdi)='egreso' THEN -1 ELSE 1 END
-                       * (COALESCE(subtotal,0) - COALESCE(descuento,0))) AS neto
-            FROM raw_cfdi
-            WHERE cliente_id=%s AND direccion='EMITIDO'
-              AND lower(estatus_sat)='vigente' AND lower(tipo_cfdi) IN ('ingreso','egreso')
-              AND periodo >= %s AND periodo <= %s
-            GROUP BY left(clave_sat, 2)
+            SELECT left(k.clave_sat, 2) AS seg,
+                   count(DISTINCT c.uuid) AS fac,
+                   sum(CASE WHEN lower(c.tipo_cfdi)='egreso' THEN -1 ELSE 1 END
+                       * (COALESCE(c.subtotal,0) - COALESCE(c.descuento,0))) AS neto
+            FROM raw_cfdi c
+            LEFT JOIN cfdi_clave k ON k.cliente_id=c.cliente_id AND k.uuid=c.uuid
+            WHERE c.cliente_id=%s AND c.direccion='EMITIDO'
+              AND lower(c.estatus_sat)='vigente' AND lower(c.tipo_cfdi) IN ('ingreso','egreso')
+              AND c.periodo >= %s AND c.periodo <= %s
+            GROUP BY left(k.clave_sat, 2)
             ORDER BY neto DESC
         """, (cli, ene1, periodo))
         filas = cur.fetchall()
-        cur.execute("""SELECT count(DISTINCT uuid) FILTER (WHERE clave_sat IS NOT NULL),
-                              count(DISTINCT uuid)
-                       FROM raw_cfdi
-                       WHERE cliente_id=%s AND direccion='EMITIDO'
-                         AND lower(estatus_sat)='vigente' AND lower(tipo_cfdi) IN ('ingreso','egreso')
-                         AND periodo >= %s AND periodo <= %s""", (cli, ene1, periodo))
+        cur.execute("""SELECT count(DISTINCT c.uuid) FILTER (WHERE k.clave_sat IS NOT NULL),
+                              count(DISTINCT c.uuid)
+                       FROM raw_cfdi c
+                       LEFT JOIN cfdi_clave k ON k.cliente_id=c.cliente_id AND k.uuid=c.uuid
+                       WHERE c.cliente_id=%s AND c.direccion='EMITIDO'
+                         AND lower(c.estatus_sat)='vigente' AND lower(c.tipo_cfdi) IN ('ingreso','egreso')
+                         AND c.periodo >= %s AND c.periodo <= %s""", (cli, ene1, periodo))
         con_clave, total_cfdi = cur.fetchone()
     finally:
         cur.close(); conn.close()
@@ -2289,9 +2297,9 @@ st.divider()
 st.subheader("Mezcla de ingresos · Modelo de negocio")
 st.caption("Composicion del ingreso emitido por segmento SAT (2 primeros digitos de la Clave producto/servicio). "
            "Define la capa especifica del cliente. YTD del ejercicio, sin IVA, vigente, neto de notas de credito.")
-st.caption("La Clave SAT se captura al cargar el CFDI por primera vez. Los CFDI cargados antes de esta version "
-           "no la traen y, por la inmutabilidad de raw_cfdi (R-DAT-01), no se reescriben: para incluir meses "
-           "viejos en la mezcla, recarga ese mes desde cero (borrar y volver a cargar). No requiere balanza.")
+st.caption("La Clave SAT vive en una tabla derivada (cfdi_clave) que se llena al cargar el CFDI; raw_cfdi no se "
+           "toca (es inmutable). Si tus CFDI se cargaron antes de capturar la clave, vuelve a subir ese archivo: "
+           "rellena la clave de esos comprobantes sin duplicar nada. No requiere balanza.")
 _cfup = st.file_uploader("CFDI emitidos del ejercicio (.xlsx) — opcional", type=['xlsx'],
                          accept_multiple_files=True, key="mz_cfdi_up")
 _pmz = periodos_cargados(cli_id)
@@ -2300,11 +2308,11 @@ if not _pmz:
 else:
     mes_mz = st.selectbox("Mes (la mezcla es YTD del ejercicio de ese mes)", _pmz, key="mz_mes")
     if st.button("Ver mezcla", key="mz_btn", type="primary"):
-        if _cfup:                                  # carga de lo que se haya subido (solo filas nuevas; no modifica las cargadas)
+        if _cfup:                                  # carga: filas nuevas a raw_cfdi + Clave SAT a cfdi_clave (esto SI se actualiza)
             try:
                 _r = cargar_cfdi(cli_id, [(f.name, f.getvalue()) for f in _cfup])
                 _n = sum(n for _, pr, n in _r if pr)
-                st.success(f"{_n} comprobantes procesados (las filas nuevas entran completas con Clave SAT).")
+                st.success(f"{_n} comprobantes procesados · Clave SAT escrita en cfdi_clave.")
             except Exception as e:
                 st.error(f"Error al cargar CFDI: {e}"); st.stop()
         mz = mezcla_ingresos(cli_id, mes_mz)       # 2) calcular y mostrar
@@ -2313,9 +2321,9 @@ else:
         if mz["total_cfdi"] == 0:
             st.warning("No hay CFDI emitidos vigentes en el ejercicio para ese mes. Revisa que el periodo este cargado.")
         elif mz["con_clave"] == 0:
-            st.warning("Ninguno de los comprobantes del ejercicio trae Clave SAT: se cargaron antes de esta version. "
-                       "raw_cfdi es inmutable, asi que no se reescriben. Para ver la mezcla de esos meses, borra y "
-                       "vuelve a cargar el periodo desde cero; los CFDI nuevos ya entran completos con Clave SAT.")
+            st.warning("Ninguno de los comprobantes del ejercicio tiene Clave SAT mapeada todavia. "
+                       "Sube el archivo de CFDI emitidos del ejercicio en el cargador de arriba y vuelve a "
+                       "'Ver mezcla': se escribe en cfdi_clave sin tocar raw_cfdi.")
         elif not mz["rows"]:
             st.warning("No hay ingreso emitido vigente en el ejercicio para ese mes.")
         else:
