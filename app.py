@@ -1241,6 +1241,15 @@ def cartera_clientes(cli, periodo):
             FROM raw_aux_clientes WHERE cliente_id=%s GROUP BY subcuenta
         """, (t12_ini, nxt, cli))
         aux = {s: dict(ter=t, ult=u, fac12=float(f or 0)) for s, t, u, f in cur.fetchall()}
+        # Estimacion para cuentas incobrables (agrupador SAT 108, acreedora, netea contra 105).
+        # Si no esta agrupada en el catalogo del cliente, no se encuentra -> el tablero lo advierte, no lo esconde.
+        cur.execute("""SELECT COALESCE(sum(saldo_final), 0)
+                       FROM insumos_balanza
+                       WHERE cliente_id=%s AND periodo=%s AND es_hoja AND cod_agrupador LIKE '108%%'""",
+                    (cli, periodo))
+        _est = cur.fetchone()
+        estim = abs(float(_est[0] or 0)) if _est else 0.0
+        estim_ok = estim > 1            # se encontro estimacion agrupada en 108
     finally:
         cur.close(); conn.close()
     out = []
@@ -1263,7 +1272,10 @@ def cartera_clientes(cli, periodo):
     tot = sum(o["saldo"] for o in out)
     for o in out:
         o["pct"] = round(100 * o["saldo"] / tot, 1) if tot else None
-    return dict(rows=out, total=tot, ejercicio=y)
+    neto = tot - estim if estim_ok else None
+    cobertura = round(100 * estim / tot, 1) if (estim_ok and tot) else None
+    return dict(rows=out, total=tot, ejercicio=y,
+                estim=estim, estim_ok=estim_ok, neto=neto, cobertura=cobertura)
 
 
 SAT_LBL = {
@@ -2210,8 +2222,21 @@ else:
         if not dd["rows"]:
             st.warning("La balanza de ese mes no tiene saldo en cuentas de Clientes (105). Revisa que la balanza este cargada.")
         else:
-            st.markdown(f"**Cartera total: {money(dd['total'])}** · {len(dd['rows'])} clientes con saldo · "
-                        f"fuente: balanza (cuenta Clientes 105).")
+            if dd["estim_ok"]:
+                st.markdown(f"**Cartera bruta {money(dd['total'])} − Estimacion {money(dd['estim'])} "
+                            f"= Cartera neta {money(dd['neto'])}** · cobertura de incobrables {dd['cobertura']}% · "
+                            f"{len(dd['rows'])} clientes.")
+                st.caption("Bruta = saldo de Clientes (105) en balanza, reconcilia por construccion. "
+                           "Neta = bruta menos la estimacion para cuentas incobrables (agrupador 108). "
+                           "El capital de trabajo se calcula sobre la bruta (NIF C-3); la neta es lo que se vuelve caja.")
+            else:
+                st.markdown(f"**Cartera bruta: {money(dd['total'])}** · {len(dd['rows'])} clientes con saldo · "
+                            f"fuente: balanza (cuenta Clientes 105).")
+                st.warning("Sin estimacion para cuentas incobrables agrupada (108.01). Cartera neta no disponible. "
+                           "La estimacion existe en libros pero no tiene codigo agrupador, asi que es invisible por "
+                           "agrupador (y es una exposicion ante el SAT en el envio de balanza, CFF 28). "
+                           "Corregir en Contabilidad: asignar agrupador 108.01 a la cuenta de estimacion en Contalink, "
+                           "reexpedir catalogo y balanza. El neteo aparece solo cuando este agrupada.")
             st.caption("Saldo de balanza (reconcilia por construccion). DSO = saldo / facturado 12 meses moviles x 365. "
                        "CONGELADA = saldo sin facturacion en 12 meses. Dias antiguedad = dias desde el ultimo "
                        "movimiento al cierre del mes: nunca queda vacio y mide que tan vieja es la cartera. "
