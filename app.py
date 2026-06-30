@@ -77,19 +77,24 @@ def parse_cfdi(data):
         fexp='Fecha Expedición',uuid='UUID',est='Estatus Sat',tipo='Tipo',uso='Uso CFDI',
         prod='Producto',sub='Subtotal sin descuentos',desc='Descuento',iva16='IVA 16%',iva8='IVA 8%',
         ivar='IVA Retención',isrr='ISR Retención',total='Total',cc='Cuenta Contable',
-        cco='Centro de Costos',uuidr='UUID Relacionado').items()}
+        cco='Centro de Costos',uuidr='UUID Relacionado',
+        metodo='Método de Pago',forma='Forma de Pago',pagado='Pagado',
+        pend='Importe pendiente',fpago='Fecha de pago').items()}
     out = []; cont = {}
+    g = lambda r, k: (r[C[k]] if C.get(k) is not None else None)   # columna ausente -> None (CFDI recibidos)
     for r in rows[4:]:
         u = r[C['uuid']]
         if not u: continue
         cont[u] = cont.get(u,0)+1
         cc = r[C['cc']]; acc = str(cc).split(' - ')[0].strip() if cc else None
         fx = _fecha(r[C['fexp']]); per = date(fx.year, fx.month, 1) if fx else None
+        pgo = g(r,'pagado'); pagado = (str(pgo).strip().upper()=='SI') if pgo is not None else None
         out.append((u,cont[u],direc,per,fx,_fecha(r[C['ftim']]),r[C['tipo']],r[C['uso']],r[C['est']],
             r[C['rfc']], str(r[C['nom']])[:120] if r[C['nom']] else None,
             str(r[C['prod']])[:200] if r[C['prod']] else None,
             _num(r[C['sub']]),_num(r[C['desc']]),_num(r[C['iva16']]),_num(r[C['iva8']]),
-            _num(r[C['ivar']]),_num(r[C['isrr']]),_num(r[C['total']]),acc,r[C['cco']],r[C['uuidr']]))
+            _num(r[C['ivar']]),_num(r[C['isrr']]),_num(r[C['total']]),acc,r[C['cco']],r[C['uuidr']],
+            g(r,'metodo'), g(r,'forma'), pagado, _num(g(r,'pend')), _fecha(g(r,'fpago'))))
     return out
 
 # ---------------------------------------------------------------------------
@@ -144,9 +149,16 @@ def procesar(cli, archivos):
             if not crows: continue
             pr = crows[0][3]
             arch, new = registrar(cur, cli, pr, 'CFDI', None, nomc, datac)
-            if new:
-                execute_values(cur, """INSERT INTO raw_cfdi (uuid,renglon,direccion,periodo,fecha_emision,fecha_timbrado,tipo_cfdi,uso_cfdi,estatus_sat,contraparte_rfc,contraparte_nom,concepto,subtotal,descuento,iva_16,iva_8,iva_retenido,isr_retenido,total,cuenta_contable,centro_costos,uuid_relacionado,cliente_id,archivo_id)
-                    VALUES %s ON CONFLICT DO NOTHING""", [t+(cli,arch) for t in crows])
+            # Sin gate 'if new': re-subir el mismo archivo backfillea los campos de pago
+            # en filas ya cargadas (UPSERT por la PK cliente_id,uuid,renglon). Refresca tambien
+            # estatus_sat para capturar cancelaciones posteriores a la primera carga.
+            execute_values(cur, """INSERT INTO raw_cfdi (uuid,renglon,direccion,periodo,fecha_emision,fecha_timbrado,tipo_cfdi,uso_cfdi,estatus_sat,contraparte_rfc,contraparte_nom,concepto,subtotal,descuento,iva_16,iva_8,iva_retenido,isr_retenido,total,cuenta_contable,centro_costos,uuid_relacionado,metodo_pago,forma_pago,pagado,importe_pendiente,fecha_pago,cliente_id,archivo_id)
+                VALUES %s
+                ON CONFLICT (cliente_id,uuid,renglon) DO UPDATE SET
+                  metodo_pago=EXCLUDED.metodo_pago, forma_pago=EXCLUDED.forma_pago,
+                  pagado=EXCLUDED.pagado, importe_pendiente=EXCLUDED.importe_pendiente,
+                  fecha_pago=EXCLUDED.fecha_pago, estatus_sat=EXCLUDED.estatus_sat""",
+                [t+(cli,arch) for t in crows])
         cur.execute("SELECT prueba,paso,severidad,detalle FROM fn_validar_periodo(%s)", (bal_id,)); integ = cur.fetchall()
         cur.execute("SELECT prueba,paso,severidad,detalle FROM fn_validar_madurez(%s)", (bal_id,)); madz = cur.fetchall()
         bloqueo = any((not ok) and sev=='BLOQUEANTE' for _,ok,sev,_ in integ) or any((not ok) and sev=='BLOQUEANTE' for _,ok,sev,_ in madz)
