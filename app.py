@@ -1212,50 +1212,47 @@ def top_clientes(cli, periodo, n=10):
         cur.close(); conn.close()
 
 
-def dso_clientes(cli, periodo):
-    """DSO por cliente desde el auxiliar de Clientes (105), as-of el mes seleccionado (YTD del ejercicio).
-       saldo = saldo_ini + facturado - cobrado; DSO = saldo / facturado x dias_YTD (None si no facturo).
-       Heredado = apertura aun sin cobrar (FIFO: cobros consumen apertura primero). Reconcilia con el agregado."""
-    y = int(str(periodo)[:4]); m = int(str(periodo)[5:7]); ej = y
-    jan1 = date(ej, 1, 1)
-    nxt = date(y+1, 1, 1) if m == 12 else date(y, m+1, 1)
-    dias = (nxt - jan1).days
+def cartera_clientes(cli, periodo):
+    """Cartera por cliente desde la BALANZA (cuentas hoja agrupador 105). Fuente autoritativa del saldo:
+       reconcilia por construccion porque ES la contabilidad. Nombre desde el catalogo vigente (o el auxiliar).
+       Ultimo movimiento y cobrado del año desde el auxiliar = señal de cartera congelada. Ordenado por exposicion."""
+    y = int(str(periodo)[:4])
     conn = get_conn(); cur = conn.cursor()
     try:
+        cur.execute("""SELECT id FROM origen_archivo WHERE cliente_id=%s AND tipo='CATALOGO' AND periodo<=%s
+                       ORDER BY periodo DESC, version DESC LIMIT 1""", (cli, periodo))
+        r = cur.fetchone(); cat_id = r[0] if r else None
+        cur.execute("""
+            SELECT b.num_cuenta, c.descripcion, b.saldo_final
+            FROM insumos_balanza b
+            LEFT JOIN raw_catalogo c ON c.archivo_id=%s AND c.num_cuenta=b.num_cuenta
+            WHERE b.cliente_id=%s AND b.periodo=%s AND b.es_hoja AND b.cod_agrupador LIKE '105%%'
+            ORDER BY b.saldo_final DESC
+        """, (cat_id, cli, periodo))
+        filas = cur.fetchall()
         cur.execute("""
             SELECT subcuenta, max(tercero) AS tercero,
-                   sum(CASE WHEN es_saldo_ini THEN debe-haber ELSE 0 END) AS saldo_ini,
-                   sum(CASE WHEN NOT es_saldo_ini AND tipo_poliza='Factura' AND fecha < %s THEN debe ELSE 0 END) AS facturado,
-                   sum(CASE WHEN NOT es_saldo_ini AND tipo_poliza='Movimiento Conciliado' AND fecha < %s THEN haber ELSE 0 END) AS cobrado
-            FROM raw_aux_clientes
-            WHERE cliente_id=%s AND ejercicio=%s
-            GROUP BY subcuenta
-        """, (nxt, nxt, cli, ej))
-        filas = cur.fetchall()
-        # Guardia de reconciliacion: saldo de Clientes (agrupador 105) segun la balanza del mes.
-        cur.execute("""SELECT COALESCE(sum(saldo_final),0) FROM insumos_balanza
-                       WHERE cliente_id=%s AND periodo=%s AND es_hoja AND cod_agrupador LIKE '105%%'""", (cli, periodo))
-        bal105 = float(cur.fetchone()[0] or 0)
+                   max(fecha) FILTER (WHERE NOT es_saldo_ini) AS ult_mov,
+                   COALESCE(sum(haber) FILTER (WHERE tipo_poliza='Movimiento Conciliado'
+                            AND extract(year from fecha)=%s), 0) AS cobrado_year
+            FROM raw_aux_clientes WHERE cliente_id=%s GROUP BY subcuenta
+        """, (y, cli))
+        aux = {s: dict(ter=t, ult=u, cob=float(c or 0)) for s, t, u, c in cur.fetchall()}
     finally:
         cur.close(); conn.close()
     out = []
-    for sub, ter, sini, fact, cob in filas:
-        sini = float(sini or 0); fact = float(fact or 0); cob = float(cob or 0)
-        saldo = sini + fact - cob
-        if abs(sini) < 1 and abs(fact) < 1 and abs(saldo) < 1: continue
-        dso = round(saldo / fact * dias, 0) if fact > 1 else None
-        heredado = max(sini - cob, 0.0)
-        out.append(dict(sub=sub, tercero=ter, saldo_ini=sini, facturado=fact, cobrado=cob,
-                        saldo=saldo, dso=dso, heredado=heredado, corriente=saldo - heredado))
-    out.sort(key=lambda x: -x["saldo"])
-    tot_saldo = sum(o["saldo"] for o in out); tot_fact = sum(o["facturado"] for o in out)
+    for num, desc, saldo in filas:
+        saldo = float(saldo or 0)
+        if abs(saldo) < 1: continue
+        a = aux.get(num, {})
+        nombre = desc or a.get("ter") or num
+        out.append(dict(cuenta=num, cliente=nombre, saldo=saldo,
+                        ult_mov=(str(a["ult"])[:10] if a.get("ult") else None),
+                        cobrado_year=a.get("cob", 0.0)))
+    tot = sum(o["saldo"] for o in out)
     for o in out:
-        o["pct"] = round(100 * o["saldo"] / tot_saldo, 1) if tot_saldo else None
-    dso_base = round(tot_saldo / tot_fact * dias, 0) if tot_fact else None
-    diff = tot_saldo - bal105
-    reconcilia = abs(diff) <= max(100.0, 0.01 * abs(bal105))   # tolerancia 1% o $100
-    return dict(rows=out, tot_saldo=tot_saldo, tot_fact=tot_fact, tot_heredado=sum(o["heredado"] for o in out),
-                dias=dias, dso_base=dso_base, bal105=bal105, diff=diff, reconcilia=reconcilia)
+        o["pct"] = round(100 * o["saldo"] / tot, 1) if tot else None
+    return dict(rows=out, total=tot, ejercicio=y)
 
 
 SAT_LBL = {
@@ -2170,15 +2167,16 @@ else:
 
 
 # ---------------------------------------------------------------------------
-# CARTERA Y DSO POR CLIENTE (auxiliar de Clientes 105) - cobranza real
+# CARTERA POR CLIENTE (saldo desde la BALANZA, cuenta Clientes 105) - prioridad de cobranza
 # ---------------------------------------------------------------------------
 st.divider()
-st.subheader("Cartera y DSO por cliente · auxiliar de Clientes (105)")
-st.caption("Desde el auxiliar contabilizado. Reconcilia con la balanza. Quien te debe, cuanto y que tan viejo. "
-           "DSO = saldo / facturado YTD x dias. Heredado = cartera de ejercicios anteriores aun sin cobrar.")
-with st.expander("Cargar auxiliar(es) de Clientes — uno por ejercicio · no requiere balanza", expanded=False):
-    st.caption("Sube aqui el auxiliar de la cuenta de Clientes (105). Es YTD: un archivo por ejercicio cubre todos sus meses. "
-               "Puedes subir varios a la vez (p. ej. 2025 y 2026). Se reemplaza por ejercicio en cada carga.")
+st.subheader("Cartera por cliente · cuenta Clientes (105)")
+st.caption("Saldo por cobrar de cada cliente, desde la BALANZA (fuente autoritativa; reconcilia por construccion). "
+           "Ordenado por exposicion: por aqui empieza la cobranza. El ultimo movimiento (del auxiliar) marca la "
+           "cartera congelada: saldo grande + sin movimiento reciente = dinero estancado, prioridad uno.")
+with st.expander("Cargar auxiliar(es) de Clientes — solo para fechas de movimiento · opcional · no requiere balanza", expanded=False):
+    st.caption("El saldo de cartera NO depende de este archivo (sale de la balanza). El auxiliar solo aporta la fecha "
+               "del ultimo movimiento por cliente. Sube el auxiliar de pólizas de la 105; puedes subir varios a la vez.")
     _auxup = st.file_uploader("Auxiliar(es) de Clientes (.xlsx)", type=['xlsx'],
                               accept_multiple_files=True, key="aux_up")
     if _auxup and st.button("Cargar auxiliares", key="aux_btn"):
@@ -2186,7 +2184,7 @@ with st.expander("Cargar auxiliar(es) de Clientes — uno por ejercicio · no re
             _res = cargar_auxiliares(cli_id, [(f.name, f.getvalue()) for f in _auxup])
             for nom, ej, n in _res:
                 if ej:
-                    st.success(f"{nom}: ejercicio {ej}, {n} movimientos cargados.")
+                    st.success(f"{nom}: {n} movimientos cargados.")
                 else:
                     st.error(f"{nom}: no se reconocio como auxiliar de Clientes (105). Revisa el archivo.")
         except Exception as e:
@@ -2196,33 +2194,21 @@ if not _pdso:
     st.caption("Carga al menos un mes.")
 else:
     mes_dso = st.selectbox("Mes", _pdso, key="dso_mes")
-    if st.button("Ver cartera y DSO", key="dso_btn"):
-        dd = dso_clientes(cli_id, mes_dso)
+    if st.button("Ver cartera", key="dso_btn"):
+        dd = cartera_clientes(cli_id, mes_dso)
         if not dd["rows"]:
-            st.warning("No hay auxiliar de Clientes cargado para este ejercicio. "
-                       "Sube el archivo AUXILIAR_DE_CUENTAS del cliente en la carga del mes.")
+            st.warning("La balanza de ese mes no tiene saldo en cuentas de Clientes (105). Revisa que la balanza este cargada.")
         else:
-            st.markdown(f"**DSO agregado (base del ejercicio): {dd['dso_base']:.0f} dias** · "
-                        f"cartera total {money(dd['tot_saldo'])} · facturado YTD {money(dd['tot_fact'])} · "
-                        f"heredado {money(dd['tot_heredado'])}")
-            if dd.get("reconcilia"):
-                st.caption(f"🟢 Reconcilia con balanza · Clientes (105) en balanza {money(dd['bal105'])} "
-                           f"≈ cartera del auxiliar {money(dd['tot_saldo'])}.")
-            else:
-                st.error(f"🔴 NO reconcilia con la balanza. Clientes (105) en balanza = {money(dd['bal105'])} "
-                         f"vs auxiliar = {money(dd['tot_saldo'])} · diferencia {money(dd['diff'])}. "
-                         f"El auxiliar esta incompleto (faltan cuentas, p. ej. exportado sin cuentas sin movimiento) "
-                         f"o hay descuadre. No reportar cartera hasta cerrar la diferencia.")
-            st.caption("El DSO agregado se infla con cartera heredada congelada. La columna Heredado la aisla: "
-                       "lo que sigue en cero o creciendo ahi es cobranza estancada, no DSO operativo.")
+            st.markdown(f"**Cartera total: {money(dd['total'])}** · {len(dd['rows'])} clientes con saldo · "
+                        f"fuente: balanza (cuenta Clientes 105).")
+            st.caption("Reconcilia por construccion: este total ES el saldo de la cuenta 105 en la balanza del mes. "
+                       "El DSO agregado del ejercicio vive en la seccion de Indicadores (CCE).")
             st.dataframe(
-                [{"Cliente": o["tercero"], "Cuenta": o["sub"],
+                [{"Cliente": o["cliente"], "Cuenta": o["cuenta"],
                   "Cartera": money(o["saldo"]),
                   "%": (f"{o['pct']}%" if o["pct"] is not None else ""),
-                  "DSO": (f"{o['dso']:.0f}" if o["dso"] is not None else "s/fact"),
-                  "Heredado": money(o["heredado"]),
-                  "Facturado YTD": money(o["facturado"]),
-                  "Cobrado YTD": money(o["cobrado"])} for o in dd["rows"]],
+                  "Cobrado " + str(dd["ejercicio"]): money(o["cobrado_year"]),
+                  "Ultimo movimiento": (o["ult_mov"] or "sin dato")} for o in dd["rows"]],
                 use_container_width=True, hide_index=True)
 
 
