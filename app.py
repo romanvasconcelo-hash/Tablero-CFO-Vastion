@@ -9,7 +9,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 import xml.etree.ElementTree as ET
 import openpyxl, hashlib, io
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 st.set_page_config(page_title="Tablero CFO Vastion", page_icon="📊", layout="centered")
 
@@ -1218,6 +1218,7 @@ def cartera_clientes(cli, periodo):
        facturacion en 12m -> 'CONGELADA' (saldo parado, prioridad de cobranza). Facturado/ultimo mov del auxiliar."""
     y = int(str(periodo)[:4]); m = int(str(periodo)[5:7])
     nxt = date(y+1, 1, 1) if m == 12 else date(y, m+1, 1)
+    corte = nxt - timedelta(days=1)                      # fin del mes seleccionado, para la antiguedad
     _mo = (y*12 + (m-1)) - 11
     t12_ini = date(_mo // 12, _mo % 12 + 1, 1)   # inicio de la ventana de 12 meses moviles
     conn = get_conn(); cur = conn.cursor()
@@ -1254,9 +1255,11 @@ def cartera_clientes(cli, periodo):
             dso = "CONGELADA"
         else:                         # sin auxiliar para esta cuenta
             dso = None
+        ult = a["ult"] if a and a.get("ult") else None
+        antig = (corte - ult).days if ult else None      # dias desde el ultimo movimiento al cierre del mes
         out.append(dict(cuenta=num, cliente=nombre, saldo=saldo, dso=dso,
                         fac12=(a["fac12"] if a else 0.0),
-                        ult_mov=(str(a["ult"])[:10] if a and a.get("ult") else None)))
+                        ult_mov=(str(ult)[:10] if ult else None), antiguedad=antig))
     tot = sum(o["saldo"] for o in out)
     for o in out:
         o["pct"] = round(100 * o["saldo"] / tot, 1) if tot else None
@@ -2210,17 +2213,19 @@ else:
             st.markdown(f"**Cartera total: {money(dd['total'])}** · {len(dd['rows'])} clientes con saldo · "
                         f"fuente: balanza (cuenta Clientes 105).")
             st.caption("Saldo de balanza (reconcilia por construccion). DSO = saldo / facturado 12 meses moviles x 365. "
-                       "CONGELADA = saldo sin facturacion en 12 meses: no es cobranza lenta, es dinero parado. "
+                       "CONGELADA = saldo sin facturacion en 12 meses. Dias antiguedad = dias desde el ultimo "
+                       "movimiento al cierre del mes: nunca queda vacio y mide que tan vieja es la cartera. "
                        "s/dato = sin auxiliar cargado para esa cuenta.")
             def _dso_txt(v):
                 if v is None: return "s/dato"
                 if v == "CONGELADA": return "CONGELADA"
                 return f"{v:.0f}"
             st.dataframe(
-                [{"Cliente": o["cliente"], "Cuenta": o["cuenta"],
+                [{"Cliente": o["cliente"],
                   "Cartera": money(o["saldo"]),
                   "%": (f"{o['pct']}%" if o["pct"] is not None else ""),
                   "DSO": _dso_txt(o["dso"]),
+                  "Dias antiguedad": (str(o["antiguedad"]) if o["antiguedad"] is not None else "s/dato"),
                   "Facturado 12m": money(o["fac12"]),
                   "Ultimo movimiento": (o["ult_mov"] or "sin dato")} for o in dd["rows"]],
                 use_container_width=True, hide_index=True)
