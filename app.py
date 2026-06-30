@@ -1272,7 +1272,7 @@ def mezcla_ingresos(cli, periodo):
     conn = get_conn(); cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT left(k.clave_sat, 2) AS seg,
+            SELECT substr(k.clave_sat::text, 1, 2) AS seg,
                    count(DISTINCT c.uuid) AS fac,
                    sum(CASE WHEN lower(c.tipo_cfdi)='egreso' THEN -1 ELSE 1 END
                        * (COALESCE(c.subtotal,0) - COALESCE(c.descuento,0))) AS neto
@@ -1281,7 +1281,7 @@ def mezcla_ingresos(cli, periodo):
             WHERE c.cliente_id=%s AND c.direccion='EMITIDO'
               AND lower(c.estatus_sat)='vigente' AND lower(c.tipo_cfdi) IN ('ingreso','egreso')
               AND c.periodo >= %s AND c.periodo <= %s
-            GROUP BY left(k.clave_sat, 2)
+            GROUP BY substr(k.clave_sat::text, 1, 2)
             ORDER BY neto DESC
         """, (cli, ene1, periodo))
         filas = cur.fetchall()
