@@ -132,9 +132,9 @@ def cargar_auxiliares(cli, lista):
 
 def cargar_cfdi(cli, lista):
     """Carga uno o varios CFDI (emitidos/recibidos) de forma independiente, SIN balanza.
-       Pensado para backfill: re-subir el ejercicio actualiza por UPSERT los campos nuevos
-       (Clave SAT, metodo/forma de pago, pagado, fecha de pago, estatus). parse_cfdi detecta
-       la direccion por el nombre de la hoja. lista: [(nombre, data)]. Devuelve [(nombre, periodo, n_filas)]."""
+       Inserta filas nuevas completas (Clave SAT y campos de pago incluidos). No modifica lo ya cargado:
+       raw_cfdi es inmutable (R-DAT-01). parse_cfdi detecta la direccion por el nombre de la hoja.
+       lista: [(nombre, data)]. Devuelve [(nombre, periodo, n_filas)]."""
     conn = get_conn(); conn.autocommit = False; cur = conn.cursor()
     res = []
     try:
@@ -213,21 +213,16 @@ def registrar(cur, cli, per, tipo, envio, nombre, data):
                 (cli, per, tipo, _sha(data))); return cur.fetchone()[0], False
 
 def _ingest_cfdi(cur, cli, nombre, data):
-    """Parsea e ingesta un CFDI (emitido/recibido) con UPSERT por (cliente_id,uuid,renglon).
-       Re-subir backfillea Clave SAT, campos de pago y estatus en filas ya cargadas, sin duplicar.
-       Devuelve (periodo, n_filas)."""
+    """Parsea e ingesta un CFDI (emitido/recibido) en su PRIMERA carga, completo: Clave SAT y campos de pago
+       entran en el mismo INSERT. ON CONFLICT DO NOTHING respeta la inmutabilidad de raw_cfdi (R-DAT-01,
+       trigger tg_cfdi_inmutable): no se modifica lo ya cargado. Devuelve (periodo, n_filas)."""
     crows = parse_cfdi(data)
     if not crows:
         return None, 0
     pr = crows[0][3]
     arch, _new = registrar(cur, cli, pr, 'CFDI', None, nombre, data)
     execute_values(cur, """INSERT INTO raw_cfdi (uuid,renglon,direccion,periodo,fecha_emision,fecha_timbrado,tipo_cfdi,uso_cfdi,estatus_sat,contraparte_rfc,contraparte_nom,concepto,subtotal,descuento,iva_16,iva_8,iva_retenido,isr_retenido,total,cuenta_contable,centro_costos,uuid_relacionado,metodo_pago,forma_pago,pagado,importe_pendiente,fecha_pago,clave_sat,cliente_id,archivo_id)
-        VALUES %s
-        ON CONFLICT (cliente_id,uuid,renglon) DO UPDATE SET
-          metodo_pago=EXCLUDED.metodo_pago, forma_pago=EXCLUDED.forma_pago,
-          pagado=EXCLUDED.pagado, importe_pendiente=EXCLUDED.importe_pendiente,
-          fecha_pago=EXCLUDED.fecha_pago, estatus_sat=EXCLUDED.estatus_sat,
-          clave_sat=EXCLUDED.clave_sat""",
+        VALUES %s ON CONFLICT DO NOTHING""",
         [t+(cli,arch) for t in crows])
     return pr, len(crows)
 
@@ -2294,8 +2289,9 @@ st.divider()
 st.subheader("Mezcla de ingresos · Modelo de negocio")
 st.caption("Composicion del ingreso emitido por segmento SAT (2 primeros digitos de la Clave producto/servicio). "
            "Define la capa especifica del cliente. YTD del ejercicio, sin IVA, vigente, neto de notas de credito.")
-st.caption("Si tus CFDI se cargaron antes de esta version no traen Clave SAT. Sube aqui los CFDI emitidos del "
-           "ejercicio (uno o varios); se cargan SOLOS al darle a 'Ver mezcla'. No requiere balanza.")
+st.caption("La Clave SAT se captura al cargar el CFDI por primera vez. Los CFDI cargados antes de esta version "
+           "no la traen y, por la inmutabilidad de raw_cfdi (R-DAT-01), no se reescriben: para incluir meses "
+           "viejos en la mezcla, recarga ese mes desde cero (borrar y volver a cargar). No requiere balanza.")
 _cfup = st.file_uploader("CFDI emitidos del ejercicio (.xlsx) — opcional", type=['xlsx'],
                          accept_multiple_files=True, key="mz_cfdi_up")
 _pmz = periodos_cargados(cli_id)
@@ -2304,11 +2300,11 @@ if not _pmz:
 else:
     mes_mz = st.selectbox("Mes (la mezcla es YTD del ejercicio de ese mes)", _pmz, key="mz_mes")
     if st.button("Ver mezcla", key="mz_btn", type="primary"):
-        if _cfup:                                  # 1) carga automatica de lo que se haya subido (backfill)
+        if _cfup:                                  # carga de lo que se haya subido (solo filas nuevas; no modifica las cargadas)
             try:
                 _r = cargar_cfdi(cli_id, [(f.name, f.getvalue()) for f in _cfup])
                 _n = sum(n for _, pr, n in _r if pr)
-                st.success(f"{_n} comprobantes cargados/actualizados con Clave SAT y campos de pago.")
+                st.success(f"{_n} comprobantes procesados (las filas nuevas entran completas con Clave SAT).")
             except Exception as e:
                 st.error(f"Error al cargar CFDI: {e}"); st.stop()
         mz = mezcla_ingresos(cli_id, mes_mz)       # 2) calcular y mostrar
@@ -2317,8 +2313,9 @@ else:
         if mz["total_cfdi"] == 0:
             st.warning("No hay CFDI emitidos vigentes en el ejercicio para ese mes. Revisa que el periodo este cargado.")
         elif mz["con_clave"] == 0:
-            st.warning("Ninguno de los comprobantes del ejercicio trae Clave SAT todavia. Sube los CFDI emitidos "
-                       "del ejercicio en el cargador de arriba y vuelve a 'Ver mezcla' — se backfillean solos.")
+            st.warning("Ninguno de los comprobantes del ejercicio trae Clave SAT: se cargaron antes de esta version. "
+                       "raw_cfdi es inmutable, asi que no se reescriben. Para ver la mezcla de esos meses, borra y "
+                       "vuelve a cargar el periodo desde cero; los CFDI nuevos ya entran completos con Clave SAT.")
         elif not mz["rows"]:
             st.warning("No hay ingreso emitido vigente en el ejercicio para ese mes.")
         else:
