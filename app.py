@@ -1213,10 +1213,13 @@ def top_clientes(cli, periodo, n=10):
 
 
 def cartera_clientes(cli, periodo):
-    """Cartera por cliente desde la BALANZA (cuentas hoja agrupador 105). Fuente autoritativa del saldo:
-       reconcilia por construccion porque ES la contabilidad. Nombre desde el catalogo vigente (o el auxiliar).
-       Ultimo movimiento y cobrado del año desde el auxiliar = señal de cartera congelada. Ordenado por exposicion."""
-    y = int(str(periodo)[:4])
+    """Cartera por cliente desde la BALANZA (cuentas hoja agrupador 105): saldo autoritativo, reconcilia por
+       construccion. DSO por cliente = saldo / facturado 12 meses moviles x 365 (Opcion 2, rotacion). Si no hay
+       facturacion en 12m -> 'CONGELADA' (saldo parado, prioridad de cobranza). Facturado/ultimo mov del auxiliar."""
+    y = int(str(periodo)[:4]); m = int(str(periodo)[5:7])
+    nxt = date(y+1, 1, 1) if m == 12 else date(y, m+1, 1)
+    _mo = (y*12 + (m-1)) - 11
+    t12_ini = date(_mo // 12, _mo % 12 + 1, 1)   # inicio de la ventana de 12 meses moviles
     conn = get_conn(); cur = conn.cursor()
     try:
         cur.execute("""SELECT id FROM origen_archivo WHERE cliente_id=%s AND tipo='CATALOGO' AND periodo<=%s
@@ -1233,22 +1236,27 @@ def cartera_clientes(cli, periodo):
         cur.execute("""
             SELECT subcuenta, max(tercero) AS tercero,
                    max(fecha) FILTER (WHERE NOT es_saldo_ini) AS ult_mov,
-                   COALESCE(sum(haber) FILTER (WHERE tipo_poliza='Movimiento Conciliado'
-                            AND extract(year from fecha)=%s), 0) AS cobrado_year
+                   COALESCE(sum(debe) FILTER (WHERE tipo_poliza='Factura' AND fecha>=%s AND fecha<%s), 0) AS fac12
             FROM raw_aux_clientes WHERE cliente_id=%s GROUP BY subcuenta
-        """, (y, cli))
-        aux = {s: dict(ter=t, ult=u, cob=float(c or 0)) for s, t, u, c in cur.fetchall()}
+        """, (t12_ini, nxt, cli))
+        aux = {s: dict(ter=t, ult=u, fac12=float(f or 0)) for s, t, u, f in cur.fetchall()}
     finally:
         cur.close(); conn.close()
     out = []
     for num, desc, saldo in filas:
         saldo = float(saldo or 0)
         if abs(saldo) < 1: continue
-        a = aux.get(num, {})
-        nombre = desc or a.get("ter") or num
-        out.append(dict(cuenta=num, cliente=nombre, saldo=saldo,
-                        ult_mov=(str(a["ult"])[:10] if a.get("ult") else None),
-                        cobrado_year=a.get("cob", 0.0)))
+        a = aux.get(num)
+        nombre = desc or (a["ter"] if a else None) or num
+        if a and a["fac12"] > 1:
+            dso = round(saldo / a["fac12"] * 365)
+        elif a:                       # hay historia en el auxiliar pero cero factura en 12m
+            dso = "CONGELADA"
+        else:                         # sin auxiliar para esta cuenta
+            dso = None
+        out.append(dict(cuenta=num, cliente=nombre, saldo=saldo, dso=dso,
+                        fac12=(a["fac12"] if a else 0.0),
+                        ult_mov=(str(a["ult"])[:10] if a and a.get("ult") else None)))
     tot = sum(o["saldo"] for o in out)
     for o in out:
         o["pct"] = round(100 * o["saldo"] / tot, 1) if tot else None
@@ -2201,13 +2209,19 @@ else:
         else:
             st.markdown(f"**Cartera total: {money(dd['total'])}** · {len(dd['rows'])} clientes con saldo · "
                         f"fuente: balanza (cuenta Clientes 105).")
-            st.caption("Reconcilia por construccion: este total ES el saldo de la cuenta 105 en la balanza del mes. "
-                       "El DSO agregado del ejercicio vive en la seccion de Indicadores (CCE).")
+            st.caption("Saldo de balanza (reconcilia por construccion). DSO = saldo / facturado 12 meses moviles x 365. "
+                       "CONGELADA = saldo sin facturacion en 12 meses: no es cobranza lenta, es dinero parado. "
+                       "s/dato = sin auxiliar cargado para esa cuenta.")
+            def _dso_txt(v):
+                if v is None: return "s/dato"
+                if v == "CONGELADA": return "CONGELADA"
+                return f"{v:.0f}"
             st.dataframe(
                 [{"Cliente": o["cliente"], "Cuenta": o["cuenta"],
                   "Cartera": money(o["saldo"]),
                   "%": (f"{o['pct']}%" if o["pct"] is not None else ""),
-                  "Cobrado " + str(dd["ejercicio"]): money(o["cobrado_year"]),
+                  "DSO": _dso_txt(o["dso"]),
+                  "Facturado 12m": money(o["fac12"]),
                   "Ultimo movimiento": (o["ult_mov"] or "sin dato")} for o in dd["rows"]],
                 use_container_width=True, hide_index=True)
 
