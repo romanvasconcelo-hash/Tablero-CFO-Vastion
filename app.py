@@ -1246,6 +1246,53 @@ def top_clientes(cli, periodo, n=10):
         cur.close(); conn.close()
 
 
+def top_proveedores(cli, periodo, n=10):
+    """Top-N proveedores por gasto neto recibido (sin IVA, vigente, neto de notas de credito).
+       Espejo de top_clientes para direccion='RECIBIDO'. Llave = RFC del emisor (proveedor). Ventanas 'mes'
+       y 'acumulado' (YTD, reinicia en enero). Trae total, # proveedores, top, concentracion top1/top3, y la
+       edad del proveedor desde el RFC (proveedor grande y joven a la vez = doble señal)."""
+    conn = get_conn(); cur = conn.cursor(); out = {}
+    try:
+        for clave in ("mes", "acumulado"):
+            if clave == "mes":
+                cond, params = "periodo = %s", (cli, periodo)
+            else:
+                cond, params = ("periodo >= date_trunc('year', %s::date) AND periodo <= %s",
+                                (cli, periodo, periodo))
+            cur.execute(f"""
+                WITH base AS (
+                  SELECT contraparte_rfc AS rfc, contraparte_nom AS nom, uuid, tipo_cfdi,
+                         (COALESCE(subtotal,0)-COALESCE(descuento,0)) AS neto
+                  FROM raw_cfdi
+                  WHERE cliente_id=%s AND direccion='RECIBIDO'
+                    AND lower(estatus_sat)='vigente'
+                    AND lower(tipo_cfdi) IN ('ingreso','egreso')
+                    AND {cond}
+                ),
+                por_prov AS (
+                  SELECT rfc, max(nom) AS proveedor, count(DISTINCT uuid) AS facturas,
+                         sum(CASE WHEN lower(tipo_cfdi)='egreso' THEN -neto ELSE neto END) AS gasto_neto
+                  FROM base GROUP BY rfc
+                )
+                SELECT rfc, proveedor, gasto_neto, facturas
+                FROM por_prov ORDER BY gasto_neto DESC
+            """, params)
+            filas = cur.fetchall()
+            total = sum(float(f[2] or 0) for f in filas)
+            top = []
+            for f in filas[:n]:
+                tipo, fconst, anios = edad_rfc(f[0])
+                top.append(dict(rfc=f[0], proveedor=f[1], gasto=float(f[2] or 0), facturas=f[3],
+                                pct=(round(100*float(f[2] or 0)/total, 1) if total else None),
+                                tipo=tipo, edad=anios))
+            conc1 = round(100*top[0]["gasto"]/total, 1) if top and total else None
+            conc3 = round(100*sum(t["gasto"] for t in top[:3])/total, 1) if top and total else None
+            out[clave] = dict(total=total, proveedores=len(filas), top=top, conc_top1=conc1, conc_top3=conc3)
+        return out
+    finally:
+        cur.close(); conn.close()
+
+
 SEG_SAT = {
     '10':'Material vivo vegetal y animal','11':'Material mineral y textil','12':'Productos quimicos',
     '13':'Resinas, caucho y espumas','14':'Papel y productos de papel','15':'Combustibles y lubricantes',
@@ -2697,6 +2744,40 @@ else:
                   "Constituido": o["constitucion"], "Edad (años)": o["edad"],
                   "Gasto YTD": money(o["gasto"]), "# CFDI": o["ncfdi"]} for o in pr["jovenes"]],
                 use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# TOP 10 PROVEEDORES (CFDI RECIBIDOS) - concentracion de compra
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Top 10 proveedores \u00b7 CFDI recibidos")
+st.caption("Concentracion de compra por proveedor (gasto neto, sin IVA, vigente, neto de notas de credito). "
+           "Llave = RFC del emisor. Dos lecturas: dependencia de suministro (perder un proveedor clave frena la "
+           "obra) y materialidad (un proveedor concentrando el gasto es foco de revision). La columna Edad marca "
+           "al que ademas es de RFC reciente.")
+_ptp = periodos_cfdi_recibido(cli_id)
+if not _ptp:
+    st.caption("Aun no hay CFDI recibidos cargados para este cliente.")
+else:
+    mes_tp = st.selectbox("Mes", _ptp, key="tp_mes")
+    if st.button("Ver Top 10 proveedores", key="tp_btn"):
+        data = top_proveedores(cli_id, mes_tp)
+        for clave, titulo in (("mes", "Del mes"), ("acumulado", "Acumulado del ejercicio (YTD)")):
+            d = data[clave]
+            st.markdown(f"**{titulo}** \u2014 {d['proveedores']} proveedores \u00b7 gasto neto {money(d['total'])}")
+            if d["conc_top1"] is not None:
+                luz = "\U0001F534" if d["conc_top1"] >= 50 else ("\U0001F7E1" if d["conc_top1"] >= 30 else "\U0001F7E2")
+                st.caption(f"{luz} Concentracion \u00b7 proveedor #1 = {d['conc_top1']}% \u00b7 Top 3 = {d['conc_top3']}%")
+            if d["top"]:
+                st.dataframe(
+                    [{"#": i, "Proveedor": t["proveedor"], "RFC": t["rfc"],
+                      "Edad (años)": ("s/dato" if t["edad"] is None else t["edad"]),
+                      "Gasto neto": money(t["gasto"]),
+                      "%": (f"{t['pct']}%" if t["pct"] is not None else ""),
+                      "Fac": t["facturas"]} for i, t in enumerate(d["top"], 1)],
+                    use_container_width=True, hide_index=True)
+            else:
+                st.caption("Sin CFDI recibidos en el rango.")
 
 
 # ---------------------------------------------------------------------------
