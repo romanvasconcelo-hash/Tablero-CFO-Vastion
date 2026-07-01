@@ -227,6 +227,42 @@ def _ingest_cfdi(cur, cli, nombre, data):
     return pr, len(crows)
 
 
+def diag_clave_sat(cli, lista):
+    """Diagnostico de SOLO LECTURA: cruza el Excel contra raw_cfdi y reporta donde falla el empate del backfill.
+       No modifica nada, no necesita el trigger apagado. Revela si el problema es renglon desalineado, uuid que
+       no existe, o filas que si se pueden rellenar."""
+    pares = []
+    for _n, data in lista:
+        for t in parse_cfdi(data):
+            pares.append((t[0], int(t[1]), (str(t[27])[:20] if t[27] else None)))
+    if not pares:
+        return None
+    conn = get_conn(); conn.autocommit = False; cur = conn.cursor()
+    try:
+        cur.execute("CREATE TEMP TABLE _bf(uuid text, renglon int, clave text) ON COMMIT DROP")
+        execute_values(cur, "INSERT INTO _bf VALUES %s", pares, template="(%s,%s,%s)")
+        cur.execute("""
+            SELECT
+              (SELECT count(*) FROM _bf),
+              (SELECT count(*) FROM _bf WHERE clave IS NOT NULL),
+              (SELECT count(DISTINCT uuid) FROM _bf),
+              (SELECT count(*) FROM raw_cfdi r JOIN _bf b ON r.uuid=b.uuid
+                 WHERE r.cliente_id=%s),
+              (SELECT count(*) FROM raw_cfdi r JOIN _bf b ON r.uuid=b.uuid AND r.renglon=b.renglon
+                 WHERE r.cliente_id=%s),
+              (SELECT count(*) FROM raw_cfdi r JOIN _bf b ON r.uuid=b.uuid AND r.renglon=b.renglon
+                 WHERE r.cliente_id=%s AND (r.clave_sat IS NULL OR r.clave_sat='')),
+              (SELECT count(DISTINCT r.uuid) FROM raw_cfdi r JOIN _bf b ON r.uuid=b.uuid
+                 WHERE r.cliente_id=%s)
+        """, (cli, cli, cli, cli))
+        row = cur.fetchone()
+        conn.rollback()
+        return dict(excel_filas=row[0], excel_con_clave=row[1], excel_uuids=row[2],
+                    db_por_uuid=row[3], db_por_par=row[4], db_rellenables=row[5], db_uuids_match=row[6])
+    finally:
+        cur.close(); conn.close()
+
+
 def backfill_clave_sat(cli, lista):
     """Backfill UNICO de clave_sat (y campos de pago) en filas historicas cargadas antes de capturar el campo.
        Rellena SOLO donde esta NULL, cruzando por (cliente_id, uuid, renglon) contra el Excel re-subido. NO toca
@@ -2756,6 +2792,37 @@ with st.expander("Backfill Clave SAT — mantenimiento · una sola vez · requie
     st.caption("Rellena clave_sat en los CFDI cargados ANTES de capturar el campo (historico 2025 y anteriores). "
                "Solo llena donde esta NULL, cruzando por UUID contra el Excel; no toca montos, fechas ni totales. "
                "raw_cfdi es inmutable, asi que el backfill exige desactivar el trigger un momento. Pasos:")
+    st.markdown("**Diagnostico primero (solo lectura, no toca nada):** sube el Excel y ve donde falla el empate.")
+    _dgup = st.file_uploader("CFDI para diagnostico (.xlsx, varios)", type=['xlsx'],
+                             accept_multiple_files=True, key="dg_up")
+    if _dgup and st.button("Diagnosticar empate Excel vs base", key="dg_btn"):
+        try:
+            dg = diag_clave_sat(cli_id, [(f.name, f.getvalue()) for f in _dgup])
+            if not dg:
+                st.warning("El Excel no arrojo filas.")
+            else:
+                st.write(f"**Excel:** {dg['excel_filas']} filas · {dg['excel_uuids']} UUID distintos · "
+                         f"{dg['excel_con_clave']} filas traen Clave SAT.")
+                st.write(f"**En la base (cliente activo):** {dg['db_uuids_match']} de esos UUID existen · "
+                         f"{dg['db_por_uuid']} filas empatan por UUID · "
+                         f"{dg['db_por_par']} empatan por (UUID + renglon) · "
+                         f"{dg['db_rellenables']} de esas estan vacias (rellenables).")
+                if dg['db_por_uuid'] == 0:
+                    st.error("Ningun UUID del Excel existe en la base para este cliente. El Excel no corresponde a "
+                             "lo cargado, o los CFDI viven bajo otro cliente_id.")
+                elif dg['db_por_par'] < dg['db_por_uuid'] * 0.9:
+                    st.warning("Los UUID SI existen, pero el renglon no alinea (empate por par mucho menor que por "
+                               "UUID). El backfill por (uuid+renglon) fallaria: hay que rellenar por UUID. Dime el "
+                               "resultado y lo ajusto.")
+                elif dg['db_rellenables'] == 0:
+                    st.info("Empatan bien pero ya no hay filas vacias: o ya tienen clave, o el reporte filtra por "
+                            "otra cosa. Avisame y revisamos el filtro.")
+                else:
+                    st.success(f"Empate sano: {dg['db_rellenables']} filas vacias listas para rellenar. "
+                               "Procede con los pasos 1-3 del backfill abajo.")
+        except Exception as e:
+            st.error(f"Error en el diagnostico: {e}")
+    st.divider()
     st.markdown("**1.** En Supabase (SQL Editor), desactiva el candado:")
     st.code("ALTER TABLE raw_cfdi DISABLE TRIGGER tg_cfdi_inmutable;", language="sql")
     st.markdown("**2.** Sube aqui los mismos Excel de CFDI (ingresos y/o egresos) y corre el backfill:")
@@ -3432,3 +3499,5 @@ else:
                     st.caption("El PDF toma la lectura escrita arriba. Si la editas, haz clic fuera del cuadro antes de descargar.")
                 except Exception as _e:
                     st.error("No se pudo generar el PDF: " + repr(_e))
+
+
