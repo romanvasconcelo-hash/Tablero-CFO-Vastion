@@ -227,6 +227,34 @@ def _ingest_cfdi(cur, cli, nombre, data):
     return pr, len(crows)
 
 
+def clave_dom_excel(lista):
+    """Clave SAT dominante por RFC leida DIRECTO del Excel (la clave viene como numero; parse_cfdi la vuelve
+       texto). Devuelve {'EMITIDO': {rfc:{seg,etiqueta,pct}}, 'RECIBIDO': {...}} para que Top 10 y 69-B muestren
+       la clave real sin depender de la base ni del backfill."""
+    agg = {"EMITIDO": {}, "RECIBIDO": {}}
+    for _n, data in lista:
+        for t in parse_cfdi(data):
+            if str(t[8] or "").lower() != "vigente":
+                continue
+            tipo = str(t[6] or "").lower()
+            if tipo not in ("ingreso", "egreso") or not t[27]:
+                continue
+            direc = t[2]; rfc = t[9] or "s/rfc"; seg = str(t[27])[:2]
+            neto = (float(t[12] or 0) - float(t[13] or 0)) * (-1 if tipo == "egreso" else 1)
+            agg[direc].setdefault(rfc, {}).setdefault(seg, 0.0)
+            agg[direc][rfc][seg] += neto
+    out = {"EMITIDO": {}, "RECIBIDO": {}}
+    for direc in agg:
+        for rfc, segs in agg[direc].items():
+            tt = sum(segs.values())
+            if not segs or tt == 0:
+                continue
+            s, v = max(segs.items(), key=lambda kv: kv[1])
+            out[direc][rfc] = dict(seg=s, etiqueta=SEG_SAT.get(s, "Segmento " + s),
+                                   pct=(round(100 * v / tt) if tt else None))
+    return out
+
+
 def analisis_cfdi_excel(lista):
     """Mezcla ingreso/gasto y coherencia por segmento SAT calculadas DIRECTO del Excel subido, con parse_cfdi
        (que captura clave_sat al 100%). Reusa el camino que ya funcionaba en emitidos: no depende de la base ni
@@ -1383,11 +1411,11 @@ def top_clientes(cli, periodo, n=10):
         cur.close(); conn.close()
 
 
-def top_proveedores(cli, periodo, n=10):
+def top_proveedores(cli, periodo, n=10, dom_ext=None):
     """Top-N proveedores por gasto neto recibido (sin IVA, vigente, neto de notas de credito).
        Espejo de top_clientes para direccion='RECIBIDO'. Llave = RFC del emisor (proveedor). Ventanas 'mes'
        y 'acumulado' (YTD, reinicia en enero). Trae total, # proveedores, top, concentracion top1/top3, y la
-       edad del proveedor desde el RFC (proveedor grande y joven a la vez = doble señal)."""
+       clave SAT dominante: si dom_ext (mapa rfc->clave leido del Excel) viene, se usa ese; si no, la base."""
     conn = get_conn(); cur = conn.cursor(); out = {}
     try:
         for clave in ("mes", "acumulado"):
@@ -1425,7 +1453,7 @@ def top_proveedores(cli, periodo, n=10):
             conc1 = round(100*top[0]["gasto"]/total, 1) if top and total else None
             conc3 = round(100*sum(t["gasto"] for t in top[:3])/total, 1) if top and total else None
             out[clave] = dict(total=total, proveedores=len(filas), top=top, conc_top1=conc1, conc_top3=conc3)
-        dom = clave_dominante_rfc(cli, periodo, "RECIBIDO")               # clave SAT dominante por proveedor
+        dom = dom_ext if dom_ext is not None else clave_dominante_rfc(cli, periodo, "RECIBIDO")
         for clave in out:
             for t in out[clave]["top"]:
                 d = dom.get(t["rfc"])
@@ -1819,7 +1847,7 @@ def periodos_cfdi_recibido(cli):
         cur.close(); conn.close()
 
 
-def proveedores_69b(cli, periodo, umbral=1_000_000, edad_max=3.0):
+def proveedores_69b(cli, periodo, umbral=1_000_000, edad_max=3.0, dom_ext=None):
     """Indicador de proveedores riesgo 69-B (CFDI RECIBIDOS). Dos criterios:
        (A) Fraccionamiento: 2+ CFDI recibidos vigentes de ingreso el mismo dia del mismo proveedor (RFC),
            cada uno < umbral pero sumando >= umbral. Mismo patron que emitidos, ahora por proveedor.
@@ -1877,7 +1905,7 @@ def proveedores_69b(cli, periodo, umbral=1_000_000, edad_max=3.0):
                               constitucion=str(fconst), joven=(anios < edad_max)))
     edad_rows.sort(key=lambda x: (x["edad"], -x["gasto"]))   # mas jovenes primero
     jovenes = [r for r in edad_rows if r["joven"] and abs(r["gasto"]) >= 1]
-    dom = clave_dominante_rfc(cli, periodo, "RECIBIDO")
+    dom = dom_ext if dom_ext is not None else clave_dominante_rfc(cli, periodo, "RECIBIDO")
     for r in frac_rows:
         d = dom.get(r["rfc"]); r["clave_dom"] = (f"[{d['seg']}] {d['etiqueta']} ({d['pct']}%)" if d else "s/clave")
     for r in jovenes:
@@ -3037,13 +3065,37 @@ st.caption("Riesgo de materialidad en proveedores (Art. 69-B CFF): deducir o acr
            "tumba la deduccion y el IVA. Dos criterios: (A) fraccionamiento -mismo dia, mismo proveedor, cada "
            "CFDI < $1M y sumando $1M o mas-; (B) edad del proveedor sacada del RFC -recien constituido facturando "
            "fuerte es bandera clasica-. SEÑAL DE RIESGO, no veredicto. Ventana: YTD del ejercicio del mes.")
+
+st.markdown("##### Paso 1 · Carga el Excel de CFDI para leer la Clave SAT")
+st.caption("La Clave SAT viene como numero en el Excel y no quedo en la base del historico. Sube aqui el Excel "
+           "de CFDI recibidos (uno o varios) y la clave dominante aparecera en las tablas de 69-B y Top 10. "
+           "Se lee al vuelo, no toca la base. Es lo primero que debes hacer en esta seccion.")
+_clup = st.file_uploader("Excel de CFDI recibidos (.xlsx, varios)", type=['xlsx'],
+                         accept_multiple_files=True, key="clave_up")
+if _clup and st.button("Leer Clave SAT del Excel", key="clave_btn", type="primary"):
+    try:
+        _dm = clave_dom_excel([(f.name, f.getvalue()) for f in _clup])
+        st.session_state["dom_recibido"] = _dm.get("RECIBIDO", {})
+        st.session_state["dom_emitido"] = _dm.get("EMITIDO", {})
+        n_rec = len(st.session_state["dom_recibido"])
+        st.success(f"Clave SAT leida del Excel: {n_rec} proveedores con clave dominante. "
+                   "Ahora aprieta 'Evaluar proveedores 69-B' abajo y la clave aparecera en la tabla.")
+    except Exception as e:
+        st.error(f"No se pudo leer el Excel: {e}")
+_dom_rec = st.session_state.get("dom_recibido")
+if _dom_rec:
+    st.success(f"Clave SAT del Excel activa ({len(_dom_rec)} proveedores). Ya alimenta 69-B y Top 10.")
+else:
+    st.warning("Aun no has cargado la Clave SAT. Mientras no lo hagas, la columna dira 's/clave'.")
+st.markdown("##### Paso 2 · Evalua")
+
 _pr = periodos_cfdi_recibido(cli_id)
 if not _pr:
     st.caption("Aun no hay CFDI recibidos cargados para este cliente.")
 else:
     mes_pr = st.selectbox("Mes (ejercicio a revisar)", _pr, key="pr69_mes")
     if st.button("Evaluar proveedores 69-B", key="pr69_btn", type="primary"):
-        pr = proveedores_69b(cli_id, mes_pr)
+        pr = proveedores_69b(cli_id, mes_pr, dom_ext=st.session_state.get("dom_recibido"))
         st.markdown(f"**Criterio A \u00b7 Fraccionamiento** \u2014 ejercicio {pr['ejercicio']}")
         if not pr["frac_rows"]:
             st.success("Sin patron de fraccionamiento en proveedores este ejercicio.")
@@ -3086,7 +3138,7 @@ if not _ptp:
 else:
     mes_tp = st.selectbox("Mes", _ptp, key="tp_mes")
     if st.button("Ver Top 10 proveedores", key="tp_btn"):
-        data = top_proveedores(cli_id, mes_tp)
+        data = top_proveedores(cli_id, mes_tp, dom_ext=st.session_state.get("dom_recibido"))
         for clave, titulo in (("mes", "Del mes"), ("acumulado", "Acumulado del ejercicio (YTD)")):
             d = data[clave]
             st.markdown(f"**{titulo}** \u2014 {d['proveedores']} proveedores \u00b7 gasto neto {money(d['total'])}")
