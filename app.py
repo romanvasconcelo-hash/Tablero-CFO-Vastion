@@ -1476,6 +1476,109 @@ def fraccionamiento(cli, periodo, umbral=1_000_000):
                 suma_total=sum(x["suma"] for x in rows))
 
 
+def edad_rfc(rfc):
+    """Edad del contribuyente a partir de la estructura del RFC. Persona moral: 12 caracteres
+       (3 letras + AAMMDD + 3 homoclave); fisica: 13 (4 letras + AAMMDD + 3). Devuelve (tipo, fecha, anios).
+       Pivote de siglo: interpreta AA como 20AA salvo que caiga en el futuro, entonces 19AA. Los RFC genericos
+       (XAXX010101000 publico, XEXX010101000 extranjero) no tienen edad util -> ('generico', None, None)."""
+    r = (rfc or "").strip().upper()
+    if r in ("XAXX010101000", "XEXX010101000"):
+        return ("generico", None, None)
+    if len(r) == 12:
+        fecha, tipo = r[3:9], "moral"
+    elif len(r) == 13:
+        fecha, tipo = r[4:10], "fisica"
+    else:
+        return ("invalido", None, None)
+    if not fecha.isdigit():
+        return (tipo, None, None)
+    yy, mm, dd = int(fecha[:2]), int(fecha[2:4]), int(fecha[4:6])
+    if not (1 <= mm <= 12 and 1 <= dd <= 31):
+        return (tipo, None, None)
+    hoy = date.today()
+    try:
+        f = date(2000 + yy, mm, dd)
+        if f > hoy:
+            f = date(1900 + yy, mm, dd)
+    except ValueError:
+        return (tipo, None, None)
+    return (tipo, f, round((hoy - f).days / 365.25, 1))
+
+
+def periodos_cfdi_recibido(cli):
+    """Meses con CFDI recibidos cargados, leidos de raw_cfdi. Para el selector del indicador de proveedores."""
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""SELECT DISTINCT periodo FROM raw_cfdi
+                       WHERE cliente_id=%s AND direccion='RECIBIDO' ORDER BY periodo DESC""", (cli,))
+        return [str(r[0]) for r in cur.fetchall()]
+    finally:
+        cur.close(); conn.close()
+
+
+def proveedores_69b(cli, periodo, umbral=1_000_000, edad_max=3.0):
+    """Indicador de proveedores riesgo 69-B (CFDI RECIBIDOS). Dos criterios:
+       (A) Fraccionamiento: 2+ CFDI recibidos vigentes de ingreso el mismo dia del mismo proveedor (RFC),
+           cada uno < umbral pero sumando >= umbral. Mismo patron que emitidos, ahora por proveedor.
+       (B) Edad del proveedor desde el RFC: proveedores jovenes con gasto relevante = bandera EFOS clasica.
+       Ambos son SEÑAL DE RIESGO, no veredicto. Ventana: YTD del ejercicio del mes. Un total por UUID (renglon=1)."""
+    y = int(str(periodo)[:4]); ene1 = date(y, 1, 1)
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        # (A) Fraccionamiento por dia + proveedor
+        cur.execute("""
+            WITH base AS (
+                SELECT uuid, fecha_emision::date AS dia, contraparte_rfc AS rfc,
+                       max(contraparte_nom) AS nom, max(total) AS total
+                FROM raw_cfdi
+                WHERE cliente_id=%s AND direccion='RECIBIDO' AND renglon=1
+                  AND lower(estatus_sat)='vigente' AND lower(tipo_cfdi)='ingreso'
+                  AND periodo >= %s AND periodo <= %s
+                GROUP BY uuid, fecha_emision::date, contraparte_rfc
+            )
+            SELECT dia, rfc, max(nom) AS nom, count(*) AS n, sum(total) AS suma
+            FROM base WHERE total < %s
+            GROUP BY dia, rfc
+            HAVING count(*) >= 2 AND sum(total) >= %s
+            ORDER BY sum(total) DESC
+        """, (cli, ene1, periodo, umbral, umbral))
+        frac = cur.fetchall()
+        # (B) Gasto por proveedor (neto de notas de credito) para la vista de edad
+        cur.execute("""
+            SELECT contraparte_rfc, max(contraparte_nom),
+                   sum(CASE WHEN lower(tipo_cfdi)='egreso' THEN -1 ELSE 1 END
+                       * (COALESCE(subtotal,0)-COALESCE(descuento,0))) AS gasto,
+                   count(DISTINCT uuid) AS ncfdi
+            FROM raw_cfdi
+            WHERE cliente_id=%s AND direccion='RECIBIDO'
+              AND lower(estatus_sat)='vigente' AND lower(tipo_cfdi) IN ('ingreso','egreso')
+              AND periodo >= %s AND periodo <= %s
+            GROUP BY contraparte_rfc
+        """, (cli, ene1, periodo))
+        prov = cur.fetchall()
+    finally:
+        cur.close(); conn.close()
+    frac_rows = []
+    for d, rfc, nom, n, s in frac:
+        tipo, fconst, anios = edad_rfc(rfc)
+        frac_rows.append(dict(dia=str(d), rfc=rfc, proveedor=(nom or rfc), n=int(n),
+                              suma=float(s or 0), tipo=tipo, edad=anios,
+                              joven=(anios is not None and anios < edad_max)))
+    edad_rows = []
+    for rfc, nom, gasto, ncfdi in prov:
+        tipo, fconst, anios = edad_rfc(rfc)
+        if anios is None:
+            continue
+        edad_rows.append(dict(rfc=rfc, proveedor=(nom or rfc), gasto=float(gasto or 0),
+                              ncfdi=int(ncfdi), tipo=tipo, edad=anios,
+                              constitucion=str(fconst), joven=(anios < edad_max)))
+    edad_rows.sort(key=lambda x: (x["edad"], -x["gasto"]))   # mas jovenes primero
+    jovenes = [r for r in edad_rows if r["joven"] and abs(r["gasto"]) >= 1]
+    return dict(ejercicio=y, umbral=umbral, edad_max=edad_max,
+                frac_rows=frac_rows, jovenes=jovenes,
+                n_prov=len([r for r in edad_rows if abs(r["gasto"]) >= 1]))
+
+
 SAT_LBL = {
     '101':'Caja','102':'Bancos','103':'Inversiones','104':'Inversiones',
     '105':'Clientes','106':'Documentos por cobrar','107':'Deudores diversos',
@@ -2552,6 +2655,47 @@ else:
             st.dataframe(
                 [{"Fecha": o["dia"], "Receptor": o["cliente"], "RFC": o["rfc"],
                   "# CFDI": o["n"], "Suma del dia": money(o["suma"])} for o in fr["rows"]],
+                use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# PROVEEDORES 69-B (CFDI RECIBIDOS) - fraccionamiento + edad del proveedor por RFC
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Proveedores 69-B \u00b7 CFDI recibidos")
+st.caption("Riesgo de materialidad en proveedores (Art. 69-B CFF): deducir o acreditar un CFDI de un EFOS te "
+           "tumba la deduccion y el IVA. Dos criterios: (A) fraccionamiento -mismo dia, mismo proveedor, cada "
+           "CFDI < $1M y sumando $1M o mas-; (B) edad del proveedor sacada del RFC -recien constituido facturando "
+           "fuerte es bandera clasica-. SEÑAL DE RIESGO, no veredicto. Ventana: YTD del ejercicio del mes.")
+_pr = periodos_cfdi_recibido(cli_id)
+if not _pr:
+    st.caption("Aun no hay CFDI recibidos cargados para este cliente.")
+else:
+    mes_pr = st.selectbox("Mes (ejercicio a revisar)", _pr, key="pr69_mes")
+    if st.button("Evaluar proveedores 69-B", key="pr69_btn", type="primary"):
+        pr = proveedores_69b(cli_id, mes_pr)
+        st.markdown(f"**Criterio A \u00b7 Fraccionamiento** \u2014 ejercicio {pr['ejercicio']}")
+        if not pr["frac_rows"]:
+            st.success("Sin patron de fraccionamiento en proveedores este ejercicio.")
+        else:
+            st.caption("Proveedor que te factura partido en pedazos sub-millon el mismo dia. "
+                       "La columna Edad marca los recien constituidos: fraccionamiento + proveedor joven apila señales.")
+            st.dataframe(
+                [{"Fecha": o["dia"], "Proveedor": o["proveedor"], "RFC": o["rfc"],
+                  "Tipo": o["tipo"], "Edad (años)": ("s/dato" if o["edad"] is None else o["edad"]),
+                  "# CFDI": o["n"], "Suma del dia": money(o["suma"])} for o in pr["frac_rows"]],
+                use_container_width=True, hide_index=True)
+        st.markdown(f"**Criterio B \u00b7 Proveedores jovenes** (menos de {pr['edad_max']:.0f} años, con gasto) "
+                    f"\u2014 {len(pr['jovenes'])} de {pr['n_prov']} proveedores")
+        if not pr["jovenes"]:
+            st.success(f"Ningun proveedor con menos de {pr['edad_max']:.0f} años y gasto relevante este ejercicio.")
+        else:
+            st.caption("Proveedor recien constituido no es delito, pero un RFC joven concentrando gasto es de lo "
+                       "primero que revisa el SAT. Cruza contra la lista 69-B publicada cuando la carguemos.")
+            st.dataframe(
+                [{"Proveedor": o["proveedor"], "RFC": o["rfc"], "Tipo": o["tipo"],
+                  "Constituido": o["constitucion"], "Edad (años)": o["edad"],
+                  "Gasto YTD": money(o["gasto"]), "# CFDI": o["ncfdi"]} for o in pr["jovenes"]],
                 use_container_width=True, hide_index=True)
 
 
