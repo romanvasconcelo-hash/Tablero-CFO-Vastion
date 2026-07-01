@@ -1191,6 +1191,18 @@ def periodos_cargados(cli):
         cur.close(); conn.close()
 
 
+def periodos_cfdi_emitido(cli):
+    """Meses con CFDI emitidos cargados, leidos de raw_cfdi. Para el selector de la mezcla:
+       refleja exactamente lo que hay, sin depender de que exista balanza de ese mes."""
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""SELECT DISTINCT periodo FROM raw_cfdi
+                       WHERE cliente_id=%s AND direccion='EMITIDO' ORDER BY periodo DESC""", (cli,))
+        return [str(r[0]) for r in cur.fetchall()]
+    finally:
+        cur.close(); conn.close()
+
+
 def top_clientes(cli, periodo, n=10):
     """Top-N clientes por ingreso neto emitido (sin IVA, vigente, neto de notas de credito).
        Llave = RFC (Codigo Cliente viene vacio). Devuelve 'mes' (periodo exacto) y
@@ -1257,40 +1269,52 @@ SEG_SAT = {
 }
 
 
-def mezcla_ingresos(lista):
-    """Modelo de negocio: mezcla del ingreso emitido por segmento SAT (2 primeros digitos de la columna
-       'Clave SAT' del Excel de CFDI). Conteo y sumatoria DIRECTOS sobre el/los archivos subidos, sin base de
-       datos. Ingreso neto = Subtotal - Descuento (sin IVA), solo Vigente, neto de notas de credito (egreso resta).
-       lista: [(nombre, bytes)]. Mismos terminos del Excel: 'Clave SAT', 'Estatus Sat', 'Tipo', 'Subtotal sin
-       descuentos', 'Descuento', 'UUID'."""
-    seg = {}; vistos = set(); total_fac = 0
-    for _nom, data in lista:
-        for t in parse_cfdi(data):                       # t: tupla del parser (idx 27 = Clave SAT)
-            if t[2] != 'EMITIDO':                        # solo emitidos
-                continue
-            u = t[0]
-            if not u or u in vistos:                     # dedupe por UUID
-                continue
-            vistos.add(u)
-            if str(t[8] or '').lower() != 'vigente':     # Estatus Sat = Vigente
-                continue
-            tipo = str(t[6] or '').lower()               # Tipo: ingreso / egreso
-            if tipo not in ('ingreso', 'egreso'):
-                continue
-            total_fac += 1
-            neto = (float(t[12] or 0) - float(t[13] or 0)) * (-1 if tipo == 'egreso' else 1)
-            s = (str(t[27]).strip()[:2] if t[27] else '??')   # 2 primeros digitos de Clave SAT
-            d = seg.setdefault(s, {'neto': 0.0, 'fac': 0})
-            d['neto'] += neto; d['fac'] += 1
-    tot = sum(v['neto'] for v in seg.values())
-    rows = []
-    for s, v in sorted(seg.items(), key=lambda kv: -kv[1]['neto']):
-        if abs(v['neto']) < 1:
-            continue
-        rows.append(dict(seg=s, etiqueta=(SEG_SAT.get(s, "Segmento " + s) if s != '??' else "Sin Clave SAT"),
-                         neto=v['neto'], facturas=v['fac'],
-                         pct=(round(100 * v['neto'] / tot, 1) if tot else None)))
-    return dict(rows=rows, total=tot, dominante=(rows[0] if rows else None), total_fac=total_fac)
+def mezcla_ingresos(cli, periodo):
+    """Modelo de negocio: mezcla del ingreso emitido por segmento SAT (2 primeros digitos de raw_cfdi.clave_sat).
+       Lee DIRECTO de la base, sin re-subir archivos. Ingreso neto = subtotal - descuento (sin IVA), solo Vigente,
+       neto de notas de credito (egreso resta). Ventana YTD del ejercicio del mes seleccionado.
+       clave_sat se captura al cargar el CFDI; los comprobantes cargados antes de esa captura salen sin clave."""
+    y = int(str(periodo)[:4]); ene1 = date(y, 1, 1)
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT substr(clave_sat, 1, 2) AS seg,
+                   count(DISTINCT uuid) AS fac,
+                   sum(CASE WHEN lower(tipo_cfdi)='egreso' THEN -1 ELSE 1 END
+                       * (COALESCE(subtotal,0) - COALESCE(descuento,0))) AS neto
+            FROM raw_cfdi
+            WHERE cliente_id=%s AND direccion='EMITIDO'
+              AND lower(estatus_sat)='vigente' AND lower(tipo_cfdi) IN ('ingreso','egreso')
+              AND periodo >= %s AND periodo <= %s
+            GROUP BY substr(clave_sat, 1, 2)
+            ORDER BY neto DESC
+        """, (cli, ene1, periodo))
+        filas = cur.fetchall()
+        cur.execute("""SELECT count(DISTINCT uuid) FILTER (WHERE clave_sat IS NOT NULL),
+                              count(DISTINCT uuid)
+                       FROM raw_cfdi
+                       WHERE cliente_id=%s AND direccion='EMITIDO'
+                         AND lower(estatus_sat)='vigente' AND lower(tipo_cfdi) IN ('ingreso','egreso')
+                         AND periodo >= %s AND periodo <= %s""", (cli, ene1, periodo))
+        con_clave, total_cfdi = cur.fetchone()
+    finally:
+        cur.close(); conn.close()
+    con_clave = int(con_clave or 0); total_cfdi = int(total_cfdi or 0)
+    tot = sum(float(f[2] or 0) for f in filas)
+    rows = []; sin_clave = 0.0
+    for seg, fac, neto in filas:
+        neto = float(neto or 0)
+        if abs(neto) < 1: continue
+        if not seg:                                    # comprobantes sin clave_sat (cargados antes de la captura)
+            sin_clave += neto; continue
+        rows.append(dict(seg=seg, etiqueta=SEG_SAT.get(seg, "Segmento " + seg),
+                         neto=neto, facturas=fac,
+                         pct=(round(100 * neto / tot, 1) if tot else None)))
+    pct_sin = round(100 * sin_clave / tot, 1) if tot else 0.0
+    return dict(rows=rows, total=tot, ejercicio=y,
+                dominante=(rows[0] if rows else None), pct_sin_clave=pct_sin,
+                con_clave=con_clave, total_cfdi=total_cfdi,
+                cob_clave=(round(100 * con_clave / total_cfdi, 1) if total_cfdi else 0.0))
 
 
 def cartera_clientes(cli, periodo):
@@ -1357,6 +1381,62 @@ def cartera_clientes(cli, periodo):
     cobertura = round(100 * estim / tot, 1) if (estim_ok and tot) else None
     return dict(rows=out, total=tot, ejercicio=y,
                 estim=estim, estim_ok=estim_ok, neto=neto, cobertura=cobertura)
+
+
+def velocidad_cobro(cli, periodo):
+    """Velocidad de cobro real (dias factura->cobro) desde el auxiliar de Clientes (raw_aux_clientes),
+       fuente autoritativa que reconcilia con la balanza. NO usa la Fecha de pago del CFDI (no fiable:
+       produce dias negativos y contradice la cartera). Empareja cada cobro (Movimiento Conciliado) con
+       sus facturas mas viejas por FIFO; dias = cobro - factura, ponderado por monto. Ventana: cobros del
+       ejercicio del mes seleccionado (ene1 a fin de mes); las facturas pueden ser de cualquier ejercicio
+       (un cobro de 2026 puede pagar una factura de 2025). Ignora dias negativos (anticipos: cobro antes de
+       factura). Los clientes congelados no aparecen aqui (no cobraron) -> viven en Cartera como CONGELADA."""
+    y = int(str(periodo)[:4]); m = int(str(periodo)[5:7])
+    ene1 = date(y, 1, 1)
+    nxt = date(y+1, 1, 1) if m == 12 else date(y, m+1, 1)   # fin de mes exclusivo
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        # Facturas (cargos) de toda la historia, por subcuenta, para el pool de emparejamiento FIFO.
+        cur.execute("""SELECT subcuenta, max(tercero), fecha, sum(debe)
+                       FROM raw_aux_clientes
+                       WHERE cliente_id=%s AND NOT es_saldo_ini AND tipo_poliza='Factura' AND debe>0
+                       GROUP BY subcuenta, fecha ORDER BY subcuenta, fecha""", (cli,))
+        fac = {}; nombre = {}
+        for sub, ter, fch, debe in cur.fetchall():
+            fac.setdefault(sub, []).append([fch, float(debe or 0)])
+            if ter: nombre[sub] = ter
+        # Cobros conciliados dentro del ejercicio del mes seleccionado.
+        cur.execute("""SELECT subcuenta, fecha, sum(haber)
+                       FROM raw_aux_clientes
+                       WHERE cliente_id=%s AND NOT es_saldo_ini AND tipo_poliza='Movimiento Conciliado'
+                         AND haber>0 AND fecha>=%s AND fecha<%s
+                       GROUP BY subcuenta, fecha ORDER BY subcuenta, fecha""", (cli, ene1, nxt))
+        cob = {}
+        for sub, fch, haber in cur.fetchall():
+            cob.setdefault(sub, []).append([fch, float(haber or 0)])
+    finally:
+        cur.close(); conn.close()
+    rows = []; tot_dm = 0.0; tot_m = 0.0
+    for sub, cobros in cob.items():
+        pool = [list(x) for x in sorted(fac.get(sub, []))]   # copia mutable, mas viejas primero
+        i = 0; dm = 0.0; m_emp = 0.0
+        for fch_c, amt in sorted(cobros):
+            rem = amt
+            while rem > 0.01 and i < len(pool):
+                fch_f, disp = pool[i]
+                take = min(rem, disp)
+                dias = (fch_c - fch_f).days
+                if dias >= 0:                      # ignora anticipos (cobro antes de la factura)
+                    dm += dias * take; m_emp += take
+                pool[i][1] = disp - take; rem -= take
+                if pool[i][1] <= 0.01: i += 1
+        if m_emp > 1:
+            rows.append(dict(sub=sub, cliente=nombre.get(sub, sub),
+                             dias=round(dm / m_emp), cobrado=m_emp))
+            tot_dm += dm; tot_m += m_emp
+    rows.sort(key=lambda x: -x["cobrado"])
+    agregado = round(tot_dm / tot_m) if tot_m else None
+    return dict(rows=rows, ejercicio=y, agregado=agregado, tot_cobrado=tot_m)
 
 
 SAT_LBL = {
@@ -2275,32 +2355,41 @@ else:
 # ---------------------------------------------------------------------------
 st.divider()
 st.subheader("Mezcla de ingresos · Modelo de negocio")
-st.caption("Composicion del ingreso emitido por segmento SAT (2 primeros digitos de la columna 'Clave SAT' del "
-           "Excel de CFDI). Conteo y suma directos sobre el archivo que subes, sin base de datos. "
-           "Ingreso neto = Subtotal - Descuento (sin IVA), solo Vigente, neto de notas de credito.")
-_cfup = st.file_uploader("Sube el Excel de CFDI emitidos (uno o varios)", type=['xlsx'],
-                         accept_multiple_files=True, key="mz_cfdi_up")
-if not _cfup:
-    st.caption("Sube el o los archivos de ingresos del periodo que quieras analizar.")
-elif st.button("Ver mezcla", key="mz_btn", type="primary"):
-    try:
-        mz = mezcla_ingresos([(f.name, f.getvalue()) for f in _cfup])
-    except Exception as e:
-        st.error(f"No se pudo leer el Excel: {e}"); st.stop()
-    if not mz["rows"]:
-        st.warning("No hay CFDI emitidos vigentes en los archivos subidos.")
-    else:
-        d = mz["dominante"]
-        st.markdown(f"**Modelo de negocio: {d['etiqueta']} ({d['pct']}%)** · "
-                    f"ingreso neto {money(mz['total'])} · {mz['total_fac']} facturas vigentes.")
-        st.caption("El segmento dominante define la capa especifica. Dos segmentos que cubren el grueso = "
-                   "dos lineas; uno solo >80% = monolinea.")
-        st.dataframe(
-            [{"Segmento": "[" + r["seg"] + "] " + r["etiqueta"],
-              "Ingreso neto": money(r["neto"]),
-              "%": (f"{r['pct']}%" if r["pct"] is not None else ""),
-              "Fac": r["facturas"]} for r in mz["rows"]],
-            use_container_width=True, hide_index=True)
+st.caption("Composicion del ingreso emitido por segmento SAT (2 primeros digitos de la Clave SAT), leida de los "
+           "CFDI ya cargados. Ingreso neto = Subtotal - Descuento (sin IVA), solo Vigente, neto de notas de credito. "
+           "YTD del ejercicio del mes seleccionado. No requiere subir nada: usa lo que cargaste por el cargador normal.")
+_pmz = periodos_cfdi_emitido(cli_id)
+if not _pmz:
+    st.caption("Aun no hay CFDI emitidos cargados para este cliente.")
+else:
+    mes_mz = st.selectbox("Mes (la mezcla es YTD del ejercicio de ese mes)", _pmz, key="mz_mes")
+    if st.button("Ver mezcla", key="mz_btn", type="primary"):
+        mz = mezcla_ingresos(cli_id, mes_mz)
+        st.caption(f"Comprobantes emitidos vigentes en el ejercicio {mz['ejercicio']}: {mz['total_cfdi']} · "
+                   f"con Clave SAT: {mz['con_clave']} ({mz['cob_clave']}%).")
+        if mz["total_cfdi"] == 0:
+            st.warning("No hay CFDI emitidos vigentes cargados en ese ejercicio.")
+        elif mz["con_clave"] == 0:
+            st.warning("Los CFDI de ese ejercicio se cargaron antes de capturar la Clave SAT y, por la inmutabilidad "
+                       "de raw_cfdi, no se reescriben. Los que cargues de aqui en adelante ya entran con su clave y "
+                       "apareceran solos.")
+        elif not mz["rows"]:
+            st.warning("No hay ingreso emitido vigente en ese ejercicio.")
+        else:
+            d = mz["dominante"]
+            st.markdown(f"**Modelo de negocio: {d['etiqueta']} ({d['pct']}%)** · "
+                        f"ingreso YTD {money(mz['total'])} · {len(mz['rows'])} segmento(s).")
+            st.caption("El segmento dominante define la capa especifica. Dos segmentos que cubren el grueso = "
+                       "dos lineas; uno solo >80% = monolinea.")
+            st.dataframe(
+                [{"Segmento": "[" + r["seg"] + "] " + r["etiqueta"],
+                  "Ingreso YTD": money(r["neto"]),
+                  "%": (f"{r['pct']}%" if r["pct"] is not None else ""),
+                  "Fac": r["facturas"]} for r in mz["rows"]],
+                use_container_width=True, hide_index=True)
+            if mz["pct_sin_clave"] > 0:
+                st.caption(f"Nota: {mz['pct_sin_clave']}% del ingreso del ejercicio aun sin Clave SAT "
+                           "(comprobantes cargados antes de la captura).")
 
 
 st.caption("Saldo por cobrar de cada cliente, desde la BALANZA (fuente autoritativa; reconcilia por construccion). "
@@ -2362,6 +2451,38 @@ else:
                   "Dias antiguedad": (str(o["antiguedad"]) if o["antiguedad"] is not None else "s/dato"),
                   "Facturado 12m": money(o["fac12"]),
                   "Ultimo movimiento": (o["ult_mov"] or "sin dato")} for o in dd["rows"]],
+                use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# VELOCIDAD DE COBRO (auxiliar de Clientes, FIFO factura->cobro) - complementa la cartera
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Velocidad de cobro \u00b7 dias factura -> cobro")
+st.caption("Cuanto tarda en cobrarse cada peso que SI se cobro, desde el auxiliar de Clientes (fuente que "
+           "reconcilia con la balanza). No usa la Fecha de pago del CFDI: ese campo no es fiable (da dias "
+           "negativos y marca como pagados a clientes que la cartera tiene congelados). Los congelados no "
+           "salen aqui porque no cobraron; viven en la Cartera de arriba. Ventana: cobros del ejercicio.")
+_pvc = periodos_cargados(cli_id)
+if not _pvc:
+    st.caption("Carga al menos un mes.")
+else:
+    mes_vc = st.selectbox("Mes (ejercicio del cobro)", _pvc, key="vc_mes")
+    if st.button("Ver velocidad de cobro", key="vc_btn"):
+        vc = velocidad_cobro(cli_id, mes_vc)
+        if not vc["rows"]:
+            st.warning("No hay cobros conciliados en el auxiliar para ese ejercicio. "
+                       "Sube el auxiliar de Clientes (105) del ejercicio en la seccion de arriba.")
+        else:
+            st.markdown(f"**Velocidad de cobro agregada: {vc['agregado']} dias** \u00b7 "
+                        f"sobre {money(vc['tot_cobrado'])} cobrado y emparejado en {vc['ejercicio']} \u00b7 "
+                        f"{len(vc['rows'])} clientes con cobro.")
+            st.caption("Emparejamiento FIFO: cada cobro salda las facturas mas viejas primero. Complementa la "
+                       "Cartera: alli ves quien te debe (saldo); aqui, que tan rapido cobras a quien si paga.")
+            st.dataframe(
+                [{"Cliente": o["cliente"], "Cuenta": o["sub"],
+                  "Dias de cobro": o["dias"],
+                  "Cobrado " + str(vc["ejercicio"]): money(o["cobrado"])} for o in vc["rows"]],
                 use_container_width=True, hide_index=True)
 
 
