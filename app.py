@@ -1288,6 +1288,11 @@ def top_proveedores(cli, periodo, n=10):
             conc1 = round(100*top[0]["gasto"]/total, 1) if top and total else None
             conc3 = round(100*sum(t["gasto"] for t in top[:3])/total, 1) if top and total else None
             out[clave] = dict(total=total, proveedores=len(filas), top=top, conc_top1=conc1, conc_top3=conc3)
+        dom = clave_dominante_rfc(cli, periodo, "RECIBIDO")               # clave SAT dominante por proveedor
+        for clave in out:
+            for t in out[clave]["top"]:
+                d = dom.get(t["rfc"])
+                t["clave_dom"] = (f"[{d['seg']}] {d['etiqueta']} ({d['pct']}%)" if d else "s/clave")
         return out
     finally:
         cur.close(); conn.close()
@@ -1362,6 +1367,120 @@ def mezcla_ingresos(cli, periodo):
                 dominante=(rows[0] if rows else None), pct_sin_clave=pct_sin,
                 con_clave=con_clave, total_cfdi=total_cfdi,
                 cob_clave=(round(100 * con_clave / total_cfdi, 1) if total_cfdi else 0.0))
+
+
+def mezcla_gastos(cli, periodo):
+    """Mezcla del GASTO recibido por segmento SAT (2 primeros digitos de clave_sat). Espejo de mezcla_ingresos
+       para direccion='RECIBIDO'. Gasto neto = subtotal - descuento (sin IVA), Vigente, neto de notas de credito
+       del proveedor (egreso resta). Ventana YTD del ejercicio del mes."""
+    y = int(str(periodo)[:4]); ene1 = date(y, 1, 1)
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT substr(clave_sat, 1, 2) AS seg,
+                   count(DISTINCT uuid) AS fac,
+                   sum(CASE WHEN lower(tipo_cfdi)='egreso' THEN -1 ELSE 1 END
+                       * (COALESCE(subtotal,0) - COALESCE(descuento,0))) AS neto
+            FROM raw_cfdi
+            WHERE cliente_id=%s AND direccion='RECIBIDO'
+              AND lower(estatus_sat)='vigente' AND lower(tipo_cfdi) IN ('ingreso','egreso')
+              AND periodo >= %s AND periodo <= %s
+            GROUP BY substr(clave_sat, 1, 2)
+            ORDER BY neto DESC
+        """, (cli, ene1, periodo))
+        filas = cur.fetchall()
+        cur.execute("""SELECT count(DISTINCT uuid) FILTER (WHERE clave_sat IS NOT NULL),
+                              count(DISTINCT uuid)
+                       FROM raw_cfdi
+                       WHERE cliente_id=%s AND direccion='RECIBIDO'
+                         AND lower(estatus_sat)='vigente' AND lower(tipo_cfdi) IN ('ingreso','egreso')
+                         AND periodo >= %s AND periodo <= %s""", (cli, ene1, periodo))
+        con_clave, total_cfdi = cur.fetchone()
+    finally:
+        cur.close(); conn.close()
+    con_clave = int(con_clave or 0); total_cfdi = int(total_cfdi or 0)
+    tot = sum(float(f[2] or 0) for f in filas)
+    rows = []; sin_clave = 0.0
+    for seg, fac, neto in filas:
+        neto = float(neto or 0)
+        if abs(neto) < 1: continue
+        if not seg:
+            sin_clave += neto; continue
+        rows.append(dict(seg=seg, etiqueta=SEG_SAT.get(seg, "Segmento " + seg),
+                         neto=neto, facturas=fac,
+                         pct=(round(100 * neto / tot, 1) if tot else None)))
+    pct_sin = round(100 * sin_clave / tot, 1) if tot else 0.0
+    return dict(rows=rows, total=tot, ejercicio=y,
+                dominante=(rows[0] if rows else None), pct_sin_clave=pct_sin,
+                con_clave=con_clave, total_cfdi=total_cfdi,
+                cob_clave=(round(100 * con_clave / total_cfdi, 1) if total_cfdi else 0.0))
+
+
+def coherencia_mezclas(cli, periodo):
+    """Coherencia ingreso vs gasto por segmento SAT, DATA-DRIVEN (sin catalogo sectorial). Alinea la mezcla de
+       ingresos y la de gastos por segmento; para cada uno da % de ingreso y % de gasto. Metrica neutral de
+       'espejo': cuanto del gasto cae en segmentos que TAMBIEN vendes (y viceversa). Marca segmentos de ingreso
+       sin gasto espejo -> ojo, la nomina timbrada y el costo via balanza NO llegan como CFDI recibido, asi que
+       una linea de servicio puede salir 'descubierta' sin que haya simulacion. Es lectura, no veredicto: el
+       veredicto fino necesita la tabla de insumos esperados (pendiente)."""
+    ing = mezcla_ingresos(cli, periodo); gas = mezcla_gastos(cli, periodo)
+    mi = {r["seg"]: r for r in ing["rows"]}; mg = {r["seg"]: r for r in gas["rows"]}
+    ti = ing["total"] or 0.0; tg = gas["total"] or 0.0
+    segs = sorted(set(mi) | set(mg),
+                  key=lambda s: -((mi.get(s, {}).get("neto", 0) or 0) + (mg.get(s, {}).get("neto", 0) or 0)))
+    filas = []
+    for s in segs:
+        ni = mi.get(s, {}).get("neto", 0.0); ng = mg.get(s, {}).get("neto", 0.0)
+        filas.append(dict(seg=s, etiqueta=SEG_SAT.get(s, "Segmento " + s),
+                          neto_ing=ni, neto_gas=ng,
+                          pct_ing=(round(100 * ni / ti, 1) if ti else 0.0),
+                          pct_gas=(round(100 * ng / tg, 1) if tg else 0.0),
+                          en_ambos=(s in mi and s in mg)))
+    espejo_gas = round(100 * sum(mg[s]["neto"] for s in mg if s in mi) / tg, 1) if tg else 0.0
+    espejo_ing = round(100 * sum(mi[s]["neto"] for s in mi if s in mg) / ti, 1) if ti else 0.0
+    ing_sin_espejo = [dict(seg=s, etiqueta=SEG_SAT.get(s, "Segmento " + s),
+                           neto=mi[s]["neto"], pct=mi[s]["pct"])
+                      for s in mi if s not in mg and (mi[s]["pct"] or 0) >= 5]
+    ing_sin_espejo.sort(key=lambda x: -(x["neto"] or 0))
+    return dict(ejercicio=ing["ejercicio"], filas=filas, tot_ing=ti, tot_gas=tg,
+                espejo_gas=espejo_gas, espejo_ing=espejo_ing, ing_sin_espejo=ing_sin_espejo)
+
+
+def clave_dominante_rfc(cli, periodo, direccion="RECIBIDO"):
+    """Segmento SAT dominante por contraparte (RFC) segun gasto/ingreso neto, YTD del ejercicio. Devuelve
+       {rfc: dict(seg, etiqueta, pct)}. Enriquece Top 10 y 69-B: informacion, no veredicto (un banco en [84]
+       financiero es coherente; el juicio de coherencia fino necesita la tabla de insumos esperados)."""
+    y = int(str(periodo)[:4]); ene1 = date(y, 1, 1)
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""
+            WITH base AS (
+              SELECT contraparte_rfc AS rfc, substr(clave_sat,1,2) AS seg,
+                     sum(CASE WHEN lower(tipo_cfdi)='egreso' THEN -1 ELSE 1 END
+                         * (COALESCE(subtotal,0)-COALESCE(descuento,0))) AS neto
+              FROM raw_cfdi
+              WHERE cliente_id=%s AND direccion=%s
+                AND lower(estatus_sat)='vigente' AND lower(tipo_cfdi) IN ('ingreso','egreso')
+                AND clave_sat IS NOT NULL
+                AND periodo >= %s AND periodo <= %s
+              GROUP BY contraparte_rfc, substr(clave_sat,1,2)
+            ),
+            tot AS (SELECT rfc, sum(neto) AS t FROM base GROUP BY rfc),
+            rk AS (
+              SELECT b.rfc, b.seg, b.neto, t.t,
+                     row_number() OVER (PARTITION BY b.rfc ORDER BY b.neto DESC) AS rn
+              FROM base b JOIN tot t ON t.rfc=b.rfc
+            )
+            SELECT rfc, seg, (CASE WHEN t<>0 THEN round(100*neto/t) ELSE NULL END) AS pct
+            FROM rk WHERE rn=1
+        """, (cli, direccion, ene1, periodo))
+        out = {}
+        for rfc, seg, pct in cur.fetchall():
+            out[rfc] = dict(seg=seg, etiqueta=SEG_SAT.get(seg, "Segmento " + (seg or "?")),
+                            pct=(int(pct) if pct is not None else None))
+        return out
+    finally:
+        cur.close(); conn.close()
 
 
 def cartera_clientes(cli, periodo):
@@ -1621,6 +1740,11 @@ def proveedores_69b(cli, periodo, umbral=1_000_000, edad_max=3.0):
                               constitucion=str(fconst), joven=(anios < edad_max)))
     edad_rows.sort(key=lambda x: (x["edad"], -x["gasto"]))   # mas jovenes primero
     jovenes = [r for r in edad_rows if r["joven"] and abs(r["gasto"]) >= 1]
+    dom = clave_dominante_rfc(cli, periodo, "RECIBIDO")
+    for r in frac_rows:
+        d = dom.get(r["rfc"]); r["clave_dom"] = (f"[{d['seg']}] {d['etiqueta']} ({d['pct']}%)" if d else "s/clave")
+    for r in jovenes:
+        d = dom.get(r["rfc"]); r["clave_dom"] = (f"[{d['seg']}] {d['etiqueta']} ({d['pct']}%)" if d else "s/clave")
     return dict(ejercicio=y, umbral=umbral, edad_max=edad_max,
                 frac_rows=frac_rows, jovenes=jovenes,
                 n_prov=len([r for r in edad_rows if abs(r["gasto"]) >= 1]))
@@ -2730,6 +2854,7 @@ else:
             st.dataframe(
                 [{"Fecha": o["dia"], "Proveedor": o["proveedor"], "RFC": o["rfc"],
                   "Tipo": o["tipo"], "Edad (años)": ("s/dato" if o["edad"] is None else o["edad"]),
+                  "Clave dominante": o.get("clave_dom", "s/clave"),
                   "# CFDI": o["n"], "Suma del dia": money(o["suma"])} for o in pr["frac_rows"]],
                 use_container_width=True, hide_index=True)
         st.markdown(f"**Criterio B \u00b7 Proveedores jovenes** (menos de {pr['edad_max']:.0f} años, con gasto) "
@@ -2742,6 +2867,7 @@ else:
             st.dataframe(
                 [{"Proveedor": o["proveedor"], "RFC": o["rfc"], "Tipo": o["tipo"],
                   "Constituido": o["constitucion"], "Edad (años)": o["edad"],
+                  "Clave dominante": o.get("clave_dom", "s/clave"),
                   "Gasto YTD": money(o["gasto"]), "# CFDI": o["ncfdi"]} for o in pr["jovenes"]],
                 use_container_width=True, hide_index=True)
 
@@ -2772,12 +2898,59 @@ else:
                 st.dataframe(
                     [{"#": i, "Proveedor": t["proveedor"], "RFC": t["rfc"],
                       "Edad (años)": ("s/dato" if t["edad"] is None else t["edad"]),
+                      "Clave dominante": t.get("clave_dom", "s/clave"),
                       "Gasto neto": money(t["gasto"]),
                       "%": (f"{t['pct']}%" if t["pct"] is not None else ""),
                       "Fac": t["facturas"]} for i, t in enumerate(d["top"], 1)],
                     use_container_width=True, hide_index=True)
             else:
                 st.caption("Sin CFDI recibidos en el rango.")
+
+
+# ---------------------------------------------------------------------------
+# COHERENCIA INGRESO vs GASTO por segmento SAT (mezcla recibidos + espejo)
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Coherencia ingreso vs gasto \u00b7 Clave SAT")
+st.caption("Prueba de sustancia data-driven: lo que vendes (mezcla de ingresos) frente a lo que compras (mezcla "
+           "de gastos), por segmento SAT. Si vendes obra debes comprar materiales, combustible y maquinaria. "
+           "Es LECTURA, no veredicto. Aviso clave: la nomina timbrada y el costo via balanza NO llegan como CFDI "
+           "recibido, asi que una linea de servicio puede verse 'descubierta' sin que haya simulacion. El "
+           "veredicto fino llega con la tabla de insumos esperados (pendiente).")
+_pco = periodos_cfdi_recibido(cli_id)
+if not _pco:
+    st.caption("Aun no hay CFDI recibidos cargados para este cliente.")
+else:
+    mes_co = st.selectbox("Mes (YTD del ejercicio)", _pco, key="coh_mes")
+    if st.button("Ver coherencia", key="coh_btn", type="primary"):
+        co = coherencia_mezclas(cli_id, mes_co)
+        st.markdown(f"**Ejercicio {co['ejercicio']}** \u00b7 ingreso {money(co['tot_ing'])} \u00b7 "
+                    f"gasto recibido {money(co['tot_gas'])}")
+        if co["tot_ing"] and co["tot_gas"]:
+            st.caption(f"Espejo \u00b7 {co['espejo_gas']}% de tu gasto cae en segmentos que tambien vendes; "
+                       f"{co['espejo_ing']}% de tu ingreso tiene gasto en el mismo segmento. "
+                       "Espejo alto = compras y vendes la misma actividad (subcontrato/comercializacion); "
+                       "espejo bajo es normal en obra (vendes [72] y compras [30] materiales).")
+        if not co["filas"]:
+            st.warning("Sin datos con Clave SAT en ese ejercicio.")
+        else:
+            st.dataframe(
+                [{"Segmento": "[" + f["seg"] + "] " + f["etiqueta"],
+                  "% Ingreso": (f"{f['pct_ing']}%" if f["neto_ing"] else "\u2014"),
+                  "% Gasto": (f"{f['pct_gas']}%" if f["neto_gas"] else "\u2014"),
+                  "Ingreso": (money(f["neto_ing"]) if f["neto_ing"] else "\u2014"),
+                  "Gasto": (money(f["neto_gas"]) if f["neto_gas"] else "\u2014")} for f in co["filas"]],
+                use_container_width=True, hide_index=True)
+            if co["ing_sin_espejo"]:
+                st.markdown("**Lineas de ingreso sin gasto espejo** (revisar con el aviso de nomina en mente):")
+                st.dataframe(
+                    [{"Segmento": "[" + s["seg"] + "] " + s["etiqueta"],
+                      "% del ingreso": f"{s['pct']}%", "Ingreso YTD": money(s["neto"])}
+                     for s in co["ing_sin_espejo"]],
+                    use_container_width=True, hide_index=True)
+                st.caption("Vendes en estos segmentos sin comprar CFDI del mismo segmento. En lineas de servicio "
+                           "([80] gestion, [70] agricola) suele ser mano de obra (nomina) que no aparece aqui, no "
+                           "simulacion. En lineas de material, un ingreso sin gasto de respaldo si merece revision.")
 
 
 # ---------------------------------------------------------------------------
