@@ -1439,6 +1439,43 @@ def velocidad_cobro(cli, periodo):
     return dict(rows=rows, ejercicio=y, agregado=agregado, tot_cobrado=tot_m)
 
 
+def fraccionamiento(cli, periodo, umbral=1_000_000):
+    """Control 1 (riesgo 69-B / materialidad) - patron de fraccionamiento en CFDI EMITIDOS.
+       Marca grupos de 2+ comprobantes vigentes de ingreso, mismo dia (fecha de emision) y mismo receptor (RFC),
+       donde cada CFDI es < umbral pero la SUMA del dia >= umbral: pedazos sub-umbral que reconstruyen una
+       operacion que habria cruzado el umbral. Es SEÑAL DE RIESGO, no veredicto: obra publica se factura por
+       estimacion/partida y puede explicar el patron; el tablero marca para revisar, no acusa. Ventana: YTD del
+       ejercicio del mes. Un total por UUID (renglon=1); la hora no se usa (el export no la trae, solo el dia)."""
+    y = int(str(periodo)[:4]); ene1 = date(y, 1, 1)
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""
+            WITH base AS (
+                SELECT uuid, fecha_emision::date AS dia, contraparte_rfc AS rfc,
+                       max(contraparte_nom) AS nom, max(total) AS total
+                FROM raw_cfdi
+                WHERE cliente_id=%s AND direccion='EMITIDO' AND renglon=1
+                  AND lower(estatus_sat)='vigente' AND lower(tipo_cfdi)='ingreso'
+                  AND periodo >= %s AND periodo <= %s
+                GROUP BY uuid, fecha_emision::date, contraparte_rfc
+            )
+            SELECT dia, rfc, max(nom) AS nom, count(*) AS n, sum(total) AS suma
+            FROM base
+            WHERE total < %s
+            GROUP BY dia, rfc
+            HAVING count(*) >= 2 AND sum(total) >= %s
+            ORDER BY sum(total) DESC
+        """, (cli, ene1, periodo, umbral, umbral))
+        filas = cur.fetchall()
+    finally:
+        cur.close(); conn.close()
+    rows = [dict(dia=str(d), rfc=r, cliente=(n or r), n=int(k), suma=float(s or 0))
+            for d, r, n, k, s in filas]
+    return dict(rows=rows, ejercicio=y, umbral=umbral,
+                n_grupos=len(rows), n_cfdi=sum(x["n"] for x in rows),
+                suma_total=sum(x["suma"] for x in rows))
+
+
 SAT_LBL = {
     '101':'Caja','102':'Bancos','103':'Inversiones','104':'Inversiones',
     '105':'Clientes','106':'Documentos por cobrar','107':'Deudores diversos',
@@ -2483,6 +2520,38 @@ else:
                 [{"Cliente": o["cliente"], "Cuenta": o["sub"],
                   "Dias de cobro": o["dias"],
                   "Cobrado " + str(vc["ejercicio"]): money(o["cobrado"])} for o in vc["rows"]],
+                use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# CONTROL 1 - FRACCIONAMIENTO / RIESGO 69-B (CFDI emitidos) - patron de materialidad
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Control 1 \u00b7 Fraccionamiento (riesgo 69-B)")
+st.caption("Patron de materialidad en CFDI emitidos: 2+ comprobantes vigentes el mismo dia al mismo receptor, "
+           "cada uno menor a $1M pero sumando $1M o mas. Son pedazos sub-millon que reconstruyen una operacion "
+           "que habria cruzado el umbral. SEÑAL DE RIESGO, no veredicto: obra publica se factura por estimacion "
+           "y puede explicar el patron. Marca para revisar. Ventana: YTD del ejercicio del mes.")
+_pfr = periodos_cfdi_emitido(cli_id)
+if not _pfr:
+    st.caption("Aun no hay CFDI emitidos cargados para este cliente.")
+else:
+    mes_fr = st.selectbox("Mes (ejercicio a revisar)", _pfr, key="fr_mes")
+    if st.button("Detectar fraccionamiento", key="fr_btn", type="primary"):
+        fr = fraccionamiento(cli_id, mes_fr)
+        if not fr["rows"]:
+            st.success(f"Sin patron de fraccionamiento en {fr['ejercicio']}: no hay dias con 2+ CFDI al mismo "
+                       "receptor, cada uno bajo $1M y sumando $1M o mas.")
+        else:
+            st.markdown(f"**{fr['n_grupos']} grupos marcados** \u00b7 {fr['n_cfdi']} CFDI \u00b7 "
+                        f"suma {money(fr['suma_total'])} \u00b7 ejercicio {fr['ejercicio']}.")
+            st.caption("Cada renglon es un dia+receptor a revisar. Prioriza receptores privados y recurrentes: "
+                       "un mismo cliente que reaparece varios dias del año pesa mas que un municipio con una "
+                       "estimacion de obra puntual. Cruza contra la Cartera: un receptor aqui que ademas este "
+                       "CONGELADO alli apila señales.")
+            st.dataframe(
+                [{"Fecha": o["dia"], "Receptor": o["cliente"], "RFC": o["rfc"],
+                  "# CFDI": o["n"], "Suma del dia": money(o["suma"])} for o in fr["rows"]],
                 use_container_width=True, hide_index=True)
 
 
