@@ -227,6 +227,36 @@ def _ingest_cfdi(cur, cli, nombre, data):
     return pr, len(crows)
 
 
+def backfill_clave_sat(cli, lista):
+    """Backfill UNICO de clave_sat (y campos de pago) en filas historicas cargadas antes de capturar el campo.
+       Rellena SOLO donde esta NULL, cruzando por (cliente_id, uuid, renglon) contra el Excel re-subido. NO toca
+       montos, fechas de emision, RFC ni totales: completa un hueco de captura con el dato que el SAT ya sello.
+       REQUIERE el trigger de inmutabilidad desactivado (ALTER TABLE raw_cfdi DISABLE TRIGGER tg_cfdi_inmutable).
+       Devuelve (filas_en_excel, filas_actualizadas). Idempotente: re-correrlo no piso lo ya rellenado."""
+    args = []
+    for _nom, data in lista:
+        for t in parse_cfdi(data):                 # t: (uuid=0, renglon=1, ... clave=27)
+            if t[27]:
+                args.append((cli, t[0], t[1], str(t[27])[:20]))
+    if not args:
+        return 0, 0
+    conn = get_conn(); conn.autocommit = False; cur = conn.cursor()
+    try:
+        res = execute_values(cur, """
+            UPDATE raw_cfdi AS r SET clave_sat = v.clave_sat
+            FROM (VALUES %s) AS v(cid, uuid, renglon, clave_sat)
+            WHERE r.cliente_id = v.cid::uuid AND r.uuid = v.uuid
+              AND r.renglon = v.renglon AND r.clave_sat IS NULL
+            RETURNING r.uuid
+        """, args, template="(%s,%s,%s,%s)", fetch=True)
+        conn.commit()
+        return len(args), len(res)
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        cur.close(); conn.close()
+
+
 def procesar(cli, archivos):
     conn = get_conn(); conn.autocommit = False; cur = conn.cursor()
     try:
@@ -2721,6 +2751,29 @@ with st.expander("Cargar auxiliar(es) de Clientes — solo para fechas de movimi
                     st.error(f"{nom}: no se reconocio como auxiliar de Clientes (105). Revisa el archivo.")
         except Exception as e:
             st.error(f"Error al cargar (¿corriste la migracion raw_aux_clientes en Supabase?): {e}")
+
+with st.expander("Backfill Clave SAT — mantenimiento · una sola vez · requiere trigger desactivado", expanded=False):
+    st.caption("Rellena clave_sat en los CFDI cargados ANTES de capturar el campo (historico 2025 y anteriores). "
+               "Solo llena donde esta NULL, cruzando por UUID contra el Excel; no toca montos, fechas ni totales. "
+               "raw_cfdi es inmutable, asi que el backfill exige desactivar el trigger un momento. Pasos:")
+    st.markdown("**1.** En Supabase (SQL Editor), desactiva el candado:")
+    st.code("ALTER TABLE raw_cfdi DISABLE TRIGGER tg_cfdi_inmutable;", language="sql")
+    st.markdown("**2.** Sube aqui los mismos Excel de CFDI (ingresos y/o egresos) y corre el backfill:")
+    _bfup = st.file_uploader("CFDI a rellenar (.xlsx, ingresos y/o egresos, varios)", type=['xlsx'],
+                             accept_multiple_files=True, key="bf_up")
+    if _bfup and st.button("Rellenar Clave SAT", key="bf_btn"):
+        try:
+            n_exc, n_upd = backfill_clave_sat(cli_id, [(f.name, f.getvalue()) for f in _bfup])
+            st.success(f"Backfill terminado: {n_upd} filas actualizadas de {n_exc} leidas del Excel. "
+                       "Las ya rellenadas o inexistentes se ignoran (idempotente).")
+            if n_upd == 0:
+                st.info("Cero actualizaciones. O ya tenian clave, o el trigger sigue activo (bloquea el UPDATE "
+                        "en silencio con error), o los UUID no coinciden con lo cargado. Revisa el paso 1.")
+        except Exception as e:
+            st.error(f"Error en el backfill: {e}. Si menciona R-DAT-01/inmutable, el trigger sigue activo: "
+                     "corre el paso 1 antes de reintentar.")
+    st.markdown("**3.** Vuelve a poner el candado (no lo olvides):")
+    st.code("ALTER TABLE raw_cfdi ENABLE TRIGGER tg_cfdi_inmutable;", language="sql")
 _pdso = periodos_cargados(cli_id)
 if not _pdso:
     st.caption("Carga al menos un mes.")
