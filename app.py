@@ -227,6 +227,74 @@ def _ingest_cfdi(cur, cli, nombre, data):
     return pr, len(crows)
 
 
+def analisis_cfdi_excel(lista):
+    """Mezcla ingreso/gasto y coherencia por segmento SAT calculadas DIRECTO del Excel subido, con parse_cfdi
+       (que captura clave_sat al 100%). Reusa el camino que ya funcionaba en emitidos: no depende de la base ni
+       del backfill. Separa por direccion segun la hoja (INGRESOS->EMITIDO, EGRESOS->RECIBIDO). Neto por concepto
+       = subtotal - descuento (sin IVA), solo Vigente, egreso resta (nota de credito). Devuelve las dos mezclas,
+       la coherencia alineada y la clave dominante por contraparte de cada lado."""
+    acc = {"EMITIDO": {}, "RECIBIDO": {}}          # seg -> [neto, set(uuid)]
+    uu = {"EMITIDO": set(), "RECIBIDO": set()}
+    dom = {"EMITIDO": {}, "RECIBIDO": {}}          # rfc -> {seg: neto}
+    domnom = {"EMITIDO": {}, "RECIBIDO": {}}
+    for _n, data in lista:
+        for t in parse_cfdi(data):
+            direc = t[2]
+            if str(t[8] or "").lower() != "vigente":            # Estatus Sat
+                continue
+            tipo = str(t[6] or "").lower()                      # Tipo
+            if tipo not in ("ingreso", "egreso"):
+                continue
+            clave = t[27]
+            if not clave:
+                continue
+            seg = str(clave)[:2]
+            neto = (float(t[12] or 0) - float(t[13] or 0)) * (-1 if tipo == "egreso" else 1)
+            d = acc[direc].setdefault(seg, [0.0, 0]); d[0] += neto; d[1] += 1
+            uu[direc].add(t[0])
+            rfc = t[9] or "s/rfc"
+            dom[direc].setdefault(rfc, {}).setdefault(seg, 0.0)
+            dom[direc][rfc][seg] += neto
+            if t[10]:
+                domnom[direc][rfc] = str(t[10])[:30]
+
+    def _mix(direc):
+        tot = sum(v[0] for v in acc[direc].values())
+        rows = []
+        for seg, (neto, fac) in sorted(acc[direc].items(), key=lambda kv: -kv[1][0]):
+            if abs(neto) < 1:
+                continue
+            rows.append(dict(seg=seg, etiqueta=SEG_SAT.get(seg, "Segmento " + seg), neto=neto, facturas=fac,
+                             pct=(round(100 * neto / tot, 1) if tot else None)))
+        return rows, tot
+
+    ing_rows, ti = _mix("EMITIDO"); gas_rows, tg = _mix("RECIBIDO")
+    mi = {r["seg"]: r for r in ing_rows}; mg = {r["seg"]: r for r in gas_rows}
+    segs = sorted(set(mi) | set(mg), key=lambda s: -((mi.get(s, {}).get("neto", 0) or 0)
+                                                      + (mg.get(s, {}).get("neto", 0) or 0)))
+    coh = [dict(seg=s, etiqueta=SEG_SAT.get(s, "Segmento " + s),
+                neto_ing=mi.get(s, {}).get("neto", 0.0), neto_gas=mg.get(s, {}).get("neto", 0.0),
+                pct_ing=(round(100 * mi[s]["neto"] / ti, 1) if s in mi and ti else 0.0),
+                pct_gas=(round(100 * mg[s]["neto"] / tg, 1) if s in mg and tg else 0.0)) for s in segs]
+    espejo_gas = round(100 * sum(mg[s]["neto"] for s in mg if s in mi) / tg, 1) if tg else 0.0
+
+    def _dom(direc):
+        out = {}
+        for rfc, segs_ in dom[direc].items():
+            tt = sum(segs_.values())
+            if not segs_ or tt == 0:
+                continue
+            s, v = max(segs_.items(), key=lambda kv: kv[1])
+            out[rfc] = dict(seg=s, etiqueta=SEG_SAT.get(s, "Segmento " + s),
+                            pct=round(100 * v / tt) if tt else None, nom=domnom[direc].get(rfc, rfc))
+        return out
+
+    return dict(ing_rows=ing_rows, gas_rows=gas_rows, tot_ing=ti, tot_gas=tg,
+                coherencia=coh, espejo_gas=espejo_gas,
+                dom_emitido=_dom("EMITIDO"), dom_recibido=_dom("RECIBIDO"),
+                n_ing=len(uu["EMITIDO"]), n_gas=len(uu["RECIBIDO"]))
+
+
 def diag_clave_sat(cli, lista):
     """Diagnostico de SOLO LECTURA: cruza el Excel contra raw_cfdi y reporta donde falla el empate del backfill.
        No modifica nada, no necesita el trigger apagado. Revela si el problema es renglon desalineado, uuid que
@@ -3082,6 +3150,34 @@ else:
                 st.caption("Vendes en estos segmentos sin comprar CFDI del mismo segmento. En lineas de servicio "
                            "([80] gestion, [70] agricola) suele ser mano de obra (nomina) que no aparece aqui, no "
                            "simulacion. En lineas de material, un ingreso sin gasto de respaldo si merece revision.")
+
+st.markdown("**Coherencia desde Excel** (sin depender de la base ni del backfill)")
+st.caption("Calcula la coherencia leyendo la Clave SAT directo del Excel con el parser (captura 100%). Es el "
+           "camino que ya funcionaba en emitidos: sirve para el historico 2025 aunque la base no tenga clave_sat. "
+           "Sube el Excel de ingresos y el de egresos del mismo periodo.")
+_cohx = st.file_uploader("Excel de CFDI: ingresos y egresos (varios)", type=['xlsx'],
+                         accept_multiple_files=True, key="cohx_up")
+if _cohx and st.button("Ver coherencia desde Excel", key="cohx_btn"):
+    try:
+        cx = analisis_cfdi_excel([(f.name, f.getvalue()) for f in _cohx])
+    except Exception as e:
+        st.error(f"No se pudo leer el Excel: {e}"); st.stop()
+    st.markdown(f"Ingreso {money(cx['tot_ing'])} ({cx['n_ing']} CFDI) \u00b7 "
+                f"gasto {money(cx['tot_gas'])} ({cx['n_gas']} CFDI)")
+    if not cx["coherencia"]:
+        st.warning("El Excel no arrojo segmentos. Revisa que sean archivos de CFDI (hojas INGRESOS / EGRESOS).")
+    else:
+        if cx["tot_gas"]:
+            st.caption(f"Espejo \u00b7 {cx['espejo_gas']}% de tu gasto cae en segmentos que tambien vendes. "
+                       "Recuerda: nomina y costo de balanza no llegan como CFDI recibido; una linea de servicio "
+                       "puede verse descubierta sin que haya simulacion.")
+        st.dataframe(
+            [{"Segmento": "[" + f["seg"] + "] " + f["etiqueta"],
+              "% Ingreso": (f"{f['pct_ing']}%" if f["neto_ing"] else "\u2014"),
+              "% Gasto": (f"{f['pct_gas']}%" if f["neto_gas"] else "\u2014"),
+              "Ingreso": (money(f["neto_ing"]) if f["neto_ing"] else "\u2014"),
+              "Gasto": (money(f["neto_gas"]) if f["neto_gas"] else "\u2014")} for f in cx["coherencia"]],
+            use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
