@@ -3066,10 +3066,11 @@ st.caption("Riesgo de materialidad en proveedores (Art. 69-B CFF): deducir o acr
            "CFDI < $1M y sumando $1M o mas-; (B) edad del proveedor sacada del RFC -recien constituido facturando "
            "fuerte es bandera clasica-. SEÑAL DE RIESGO, no veredicto. Ventana: YTD del ejercicio del mes.")
 
-st.markdown("##### Paso 1 · Carga el Excel de CFDI para leer la Clave SAT")
-st.caption("La Clave SAT viene como numero en el Excel y no quedo en la base del historico. Sube aqui el Excel "
-           "de CFDI recibidos (uno o varios) y la clave dominante aparecera en las tablas de 69-B y Top 10. "
-           "Se lee al vuelo, no toca la base. Es lo primero que debes hacer en esta seccion.")
+st.markdown("##### Paso 1 · Carga TODOS los meses de Excel de CFDI para leer la Clave SAT")
+st.caption("IMPORTANTE: sube TODOS los meses que tengas cargados (ene-2025 en adelante), ingresos y egresos, de "
+           "una sola vez. La clave de cada proveedor solo esta en el mes en que facturo; si subes un solo mes, los "
+           "proveedores de otros meses saldran 's/clave'. La Clave SAT viene como numero en el Excel y no quedo en "
+           "la base del historico, por eso se lee aqui al vuelo. No toca la base.")
 _clup = st.file_uploader("Excel de CFDI recibidos (.xlsx, varios)", type=['xlsx'],
                          accept_multiple_files=True, key="clave_up")
 if _clup and st.button("Leer Clave SAT del Excel", key="clave_btn", type="primary"):
