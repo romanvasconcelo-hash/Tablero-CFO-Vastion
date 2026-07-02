@@ -360,11 +360,10 @@ def diag_clave_sat(cli, lista):
 
 
 def backfill_clave_sat(cli, lista):
-    """Backfill de clave_sat en filas historicas cargadas antes de capturar el campo. AUTO-CONTENIDO: desactiva
-       el trigger de inmutabilidad, rellena SOLO donde clave_sat esta NULL o vacia cruzando por
-       (cliente_id, uuid, renglon), y REACTIVA el trigger, todo en UNA transaccion atomica (si algo falla, el
-       rollback restaura el trigger y no deja nada a medias). No toca montos, fechas, RFC ni totales: completa
-       un hueco de captura con el dato que el SAT ya sello. Devuelve (filas_excel, filas_actualizadas)."""
+    """Backfill de clave_sat en filas historicas cargadas antes de capturar el campo. Rellena SOLO donde
+       clave_sat esta NULL o vacia, cruzando por (cliente_id, uuid, renglon). No toca montos, fechas, RFC ni
+       totales: completa un hueco de captura con el dato que el SAT ya sello. raw_cfdi no tiene trigger de
+       inmutabilidad, asi que el UPDATE corre directo. Devuelve (filas_excel, filas_actualizadas)."""
     args = []
     for _n, data in lista:
         for t in parse_cfdi(data):                 # t: (uuid=0, renglon=1, ... clave=27)
@@ -374,7 +373,6 @@ def backfill_clave_sat(cli, lista):
         return 0, 0
     conn = get_conn(); conn.autocommit = False; cur = conn.cursor()
     try:
-        cur.execute("ALTER TABLE raw_cfdi DISABLE TRIGGER tg_cfdi_inmutable")
         res = execute_values(cur, """
             UPDATE raw_cfdi AS r SET clave_sat = v.clave_sat
             FROM (VALUES %s) AS v(cid, uuid, renglon, clave_sat)
@@ -383,7 +381,6 @@ def backfill_clave_sat(cli, lista):
               AND (r.clave_sat IS NULL OR r.clave_sat = '')
             RETURNING r.uuid
         """, args, template="(%s,%s,%s,%s)", fetch=True)
-        cur.execute("ALTER TABLE raw_cfdi ENABLE TRIGGER tg_cfdi_inmutable")
         conn.commit()
         return len(args), len(res)
     except Exception:
@@ -2922,32 +2919,22 @@ with st.expander("Backfill Clave SAT — mantenimiento · una sola vez · requie
         except Exception as e:
             st.error(f"Error en el diagnostico: {e}")
     st.divider()
-    st.markdown("**Backfill (un solo boton):** sube el mismo Excel y rellena. La app abre y cierra el candado "
-                "sola, en una transaccion; tu no tocas SQL.")
-    _bfup = st.file_uploader("CFDI a rellenar (.xlsx, ingresos y/o egresos, varios)", type=['xlsx'],
+    st.markdown("**Backfill (un solo boton):** sube TODOS los meses de Excel (ingresos y egresos) y rellena. "
+                "raw_cfdi no tiene candado; el UPDATE corre directo. Es de una sola vez: despues la clave queda "
+                "en la base y todos los modulos la leen solos.")
+    _bfup = st.file_uploader("CFDI a rellenar (.xlsx, TODOS los meses, ingresos y egresos)", type=['xlsx'],
                              accept_multiple_files=True, key="bf_up")
     if _bfup and st.button("Rellenar Clave SAT", key="bf_btn", type="primary"):
         try:
             n_exc, n_upd = backfill_clave_sat(cli_id, [(f.name, f.getvalue()) for f in _bfup])
             if n_upd > 0:
                 st.success(f"Listo: {n_upd} filas rellenadas de {n_exc} leidas del Excel. "
-                           "Vuelve a Coherencia / Mezcla y ya debe salir el segmento.")
+                           "La clave quedo en la base. Ve a Coherencia / 69-B / Top 10 y ya sale sola.")
             else:
-                st.warning(f"0 filas actualizadas de {n_exc} leidas. Los UUID+renglon del Excel no empatan con "
-                           "filas vacias en la base. Corre el diagnostico de arriba para ver donde falla el empate.")
+                st.warning(f"0 filas actualizadas de {n_exc} leidas. Los UUID empatan pero el renglon no; "
+                           "avisame y cambio el cruce a solo UUID.")
         except Exception as e:
-            msg = str(e)
-            if "permission" in msg.lower() or "owner" in msg.lower() or "must be owner" in msg.lower():
-                st.error("El rol de la app no tiene permiso para desactivar el trigger. Usa el respaldo manual "
-                         "de abajo: corre el DISABLE en Supabase, aprieta el boton otra vez, y luego el ENABLE.")
-            else:
-                st.error(f"Error en el backfill: {e}")
-    with st.expander("Respaldo manual (solo si el boton dio error de permiso)"):
-        st.markdown("**1.** En Supabase, desactiva el candado:")
-        st.code("ALTER TABLE raw_cfdi DISABLE TRIGGER tg_cfdi_inmutable;", language="sql")
-        st.markdown("**2.** Aprieta 'Rellenar Clave SAT' arriba.")
-        st.markdown("**3.** Vuelve a poner el candado:")
-        st.code("ALTER TABLE raw_cfdi ENABLE TRIGGER tg_cfdi_inmutable;", language="sql")
+            st.error(f"Error en el backfill: {e}")
 _pdso = periodos_cargados(cli_id)
 if not _pdso:
     st.caption("Carga al menos un mes.")
