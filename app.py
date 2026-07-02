@@ -342,14 +342,15 @@ def diag_clave_sat(cli, lista):
               (SELECT count(*) FROM _bf),
               (SELECT count(*) FROM _bf WHERE clave IS NOT NULL),
               (SELECT count(DISTINCT uuid) FROM _bf),
-              (SELECT count(*) FROM raw_cfdi r JOIN _bf b ON r.uuid=b.uuid
-                 WHERE r.cliente_id=%s),
-              (SELECT count(*) FROM raw_cfdi r JOIN _bf b ON r.uuid=b.uuid AND r.renglon=b.renglon
-                 WHERE r.cliente_id=%s),
-              (SELECT count(*) FROM raw_cfdi r JOIN _bf b ON r.uuid=b.uuid AND r.renglon=b.renglon
-                 WHERE r.cliente_id=%s AND (r.clave_sat IS NULL OR r.clave_sat='')),
-              (SELECT count(DISTINCT r.uuid) FROM raw_cfdi r JOIN _bf b ON r.uuid=b.uuid
-                 WHERE r.cliente_id=%s)
+              (SELECT count(*) FROM raw_cfdi r
+                 WHERE r.cliente_id=%s AND r.uuid IN (SELECT uuid FROM _bf)),
+              (SELECT count(*) FROM raw_cfdi r
+                 WHERE r.cliente_id=%s AND (r.uuid, r.renglon) IN (SELECT uuid, renglon FROM _bf)),
+              (SELECT count(*) FROM raw_cfdi r
+                 WHERE r.cliente_id=%s AND (r.uuid, r.renglon) IN (SELECT uuid, renglon FROM _bf)
+                   AND (r.clave_sat IS NULL OR r.clave_sat='')),
+              (SELECT count(DISTINCT r.uuid) FROM raw_cfdi r
+                 WHERE r.cliente_id=%s AND r.uuid IN (SELECT uuid FROM _bf))
         """, (cli, cli, cli, cli))
         row = cur.fetchone()
         conn.rollback()
